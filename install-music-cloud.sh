@@ -2,36 +2,48 @@
 set -Eeuo pipefail
 
 # ==============================================================================
-# Universal Music Cloud Installer
+# Универсальный установщик Music Cloud
 #
-# Debian/Ubuntu with systemd; amd64 or arm64.
+# Debian/Ubuntu с systemd; архитектуры amd64 или arm64.
 #
-# Deployment modes:
-#   vps  — public IPv4/DNS, Caddy obtains HTTPS on inbound TCP 80/443.
-#   home — home network/CGNAT, outbound-only Cloudflare Tunnel to local Caddy.
-#   auto — compares the public IPv4 with addresses assigned to this machine and
-#          proposes vps or home; the user can override the result.
+# Режимы установки:
+# 
+# vps  — сервер с публичным IPv4/DNS. Caddy получает HTTPS через входящие
+#        подключения TCP 80/443.
 #
-# Public URLs on one hostname:
-#   https://example.com/          Navidrome
-#   https://example.com/uploads/  Copyparty uploader
-#   https://example.com/tags/     Tagr metadata editor
+# home — домашняя сеть/CGNAT. Используется исходящее подключение Cloudflare
+#        Tunnel к локальному Caddy.
 #
-# The script does not create system users and does not modify SSH.
+# auto — сравнивает публичный IPv4 с адресами, назначенными этому устройству,
+#        и предлагает режим vps или home; пользователь может изменить выбор.
 #
-# Install interactively:
-#   sudo bash install-music-cloud-universal.sh
+# Публичные адреса на одном домене:
 #
-# Force deployment mode:
-#   sudo bash install-music-cloud-universal.sh --mode vps
-#   sudo bash install-music-cloud-universal.sh --mode home
+# https://example.com/              Navidrome
+# https://example.com/uploads/      загрузчик Copyparty
+# https://example.com/tags/         редактор метаданных Tagr
 #
-# Repair import on an existing installation without rebuilding containers:
-#   sudo bash install-music-cloud-universal.sh --repair-import
+# Скрипт не создаёт системных пользователей и не изменяет настройки SSH.
 #
-# Diagnose / remove:
-#   sudo bash install-music-cloud-universal.sh --diagnose
-#   sudo bash install-music-cloud-universal.sh --uninstall
+# Интерактивная установка:
+#
+# sudo bash install-music-cloud-universal.sh
+#
+# Принудительный выбор режима установки:
+#
+# sudo bash install-music-cloud-universal.sh --mode vps
+# sudo bash install-music-cloud-universal.sh --mode home
+#
+# Восстановление импорта музыки в существующей установке
+# без пересборки контейнеров:
+#
+# sudo bash install-music-cloud-universal.sh --repair-import
+#
+# Диагностика / удаление:
+#
+# sudo bash install-music-cloud-universal.sh --diagnose
+# sudo bash install-music-cloud-universal.sh --uninstall
+#
 # ==============================================================================
 
 APP_NAME="music-cloud"
