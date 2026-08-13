@@ -47,7 +47,7 @@ set -Eeuo pipefail
 # ==============================================================================
 
 APP_NAME="music-cloud"
-SCRIPT_VERSION="5.3.0-universal"
+SCRIPT_VERSION="5.6.0-universal"
 DATA_DIR="/srv/${APP_NAME}"
 STACK_DIR="/opt/${APP_NAME}"
 STATE_DIR="/etc/${APP_NAME}"
@@ -87,6 +87,7 @@ AUTO_IMPORT_SCRIPT="/usr/local/bin/${APP_NAME}-auto-import"
 IMPORT_BATCH_SCRIPT="/usr/local/bin/${APP_NAME}-stage-import-batch"
 METADATA_PREFLIGHT_SCRIPT="/usr/local/bin/${APP_NAME}-metadata-preflight"
 ONLINE_ENRICH_SCRIPT="/usr/local/bin/${APP_NAME}-online-enrich"
+ALBUM_ENRICH_SCRIPT="/usr/local/bin/${APP_NAME}-album-enrich"
 DEDUPE_SCRIPT="/usr/local/bin/${APP_NAME}-dedupe"
 BEETS_WRAPPER="/usr/local/bin/${APP_NAME}-beet"
 BEETS_UPDATE_SCRIPT="/usr/local/bin/${APP_NAME}-beets-update"
@@ -241,7 +242,7 @@ load_install_state() {
     . "${INSTALL_STATE_FILE}"
 
     case "${STATE_VERSION:-}" in
-        3|3.*|4|4.*|5.0-home-cf|5.0.1-home-cf|5.0.2-home-cf|5.1.0-universal|5.1.1-universal|5.1.2-universal|5.2.0-universal|5.2.1-universal|5.2.2-universal|5.2.3-universal|5.3.0-universal)
+        3|3.*|4|4.*|5.0-home-cf|5.0.1-home-cf|5.0.2-home-cf|5.1.0-universal|5.1.1-universal|5.1.2-universal|5.2.0-universal|5.2.1-universal|5.2.2-universal|5.2.3-universal|5.3.0-universal|5.4.0-universal|5.5.0-universal|5.6.0-universal)
             ;;
         *)
             die "Неподдерживаемая версия файла состояния ${INSTALL_STATE_FILE}."
@@ -1830,7 +1831,7 @@ fetchart:
     - front
   sources:
     - filesystem
-    - coverart
+    - coverart: release releasegroup
     - itunes
 
 embedart:
@@ -3224,13 +3225,8 @@ def parse_filename(
         if artist and title:
             return artist, title
 
-    # Artist__Title.
-    match = re.match(r"^(.+?)__+(.+)$", raw)
-    if match:
-        artist = humanize(match.group(1))
-        title = humanize(match.group(2))
-        if artist and title:
-            return artist, title
+    # Double underscores are treated as ordinary title separators. They are
+    # common in downloader filenames and are too ambiguous to mean Artist__Title.
 
     comma = split_comma_collaboration(raw)
     if comma:
@@ -3408,6 +3404,1087 @@ PYMUSICCLOUDPREFLIGHT
     chmod 0755 "${METADATA_PREFLIGHT_SCRIPT}"
     "${BEETS_VENV}/bin/python" -m py_compile "${METADATA_PREFLIGHT_SCRIPT}"
 
+    cat > "${ALBUM_ENRICH_SCRIPT}" <<'PYMUSICCLOUDALBUM'
+#!/opt/music-cloud/beets-venv/bin/python
+from __future__ import annotations
+
+import os
+import re
+import shutil
+import sys
+import time
+import unicodedata
+from collections import Counter, defaultdict
+from difflib import SequenceMatcher
+from pathlib import Path
+from typing import Any
+
+import requests
+from mutagen import File as MutagenFile
+
+
+AUDIO_EXTENSIONS = {
+    ".mp3", ".flac", ".m4a", ".mp4", ".ogg", ".opus", ".wav", ".wave",
+    ".aif", ".aiff", ".alac", ".wma", ".ape", ".mpc", ".tta", ".dsf", ".dff",
+}
+PLACEHOLDERS = {
+    "", "unknown", "unknown artist", "unknown album", "unknown title",
+    "unknown track", "untitled", "none", "n/a", "na", "<unknown>",
+    "(unknown)", "singles", "singles.1", "00-00", "0",
+}
+GENERIC_ALBUMS = {
+    "album", "albums", "audio", "music", "songs", "tracks", "upload", "uploads",
+    "incoming", "downloads", "download", "misc", "various",
+}
+
+MB_BASE = "https://musicbrainz.org/ws/2"
+CAA_BASE = "https://coverartarchive.org"
+USER_AGENT = "MusicCloud/5.5.0 (https://github.com/hase9awa/music-cloud)"
+REQUEST_INTERVAL = 1.10
+REQUEST_TIMEOUT = 15
+MAX_FAILURES = 3
+
+MAX_RECORDING_RESULTS = 8
+MAX_RELEASE_DETAILS = 28
+MIN_RELEASE_SUPPORT = 3
+MIN_PAIR_SCORE = 0.68
+MIN_CLUSTER_AVG = 0.77
+MIN_CLUSTER_COVERAGE = 0.25
+MIN_CLUSTER_TRACKS = 3
+MIN_RG_MARGIN = 0.045
+
+http = requests.Session()
+http.headers.update({
+    "User-Agent": USER_AGENT,
+    "Accept": "application/json",
+})
+
+last_request = 0.0
+failures = 0
+recording_cache: dict[tuple[str, str], list[dict[str, Any]]] = {}
+release_cache: dict[str, dict[str, Any] | None] = {}
+
+
+def plain(value: object) -> str:
+    if isinstance(value, (list, tuple)):
+        value = value[0] if value else ""
+    return str(value or "").strip()
+
+
+def humanize(value: str) -> str:
+    value = unicodedata.normalize("NFKC", value)
+    value = re.sub(r"[_\s]+", " ", value)
+    value = re.sub(r"\s*,\s*", ", ", value)
+    return value.strip(" ._-–—")
+
+
+def norm(value: object) -> str:
+    text = humanize(plain(value)).casefold()
+    text = re.sub(r"[^\w]+", " ", text, flags=re.UNICODE)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def missing(value: object) -> bool:
+    return norm(value) in PLACEHOLDERS
+
+
+def similarity(a: object, b: object) -> float:
+    left = norm(a)
+    right = norm(b)
+    if not left or not right:
+        return 0.0
+    return SequenceMatcher(None, left, right).ratio()
+
+
+def token_overlap(a: object, b: object) -> float:
+    left = set(norm(a).split())
+    right = set(norm(b).split())
+    if not left or not right:
+        return 0.0
+    return len(left & right) / max(len(left), len(right))
+
+
+def artist_credit(value: Any) -> str:
+    if not isinstance(value, list):
+        return ""
+    out: list[str] = []
+    for part in value:
+        if not isinstance(part, dict):
+            continue
+        name = plain(part.get("name"))
+        if not name and isinstance(part.get("artist"), dict):
+            name = plain(part["artist"].get("name"))
+        if name:
+            out.append(name)
+        joinphrase = plain(part.get("joinphrase"))
+        if joinphrase:
+            out.append(joinphrase)
+    return "".join(out).strip()
+
+
+def artist_ids(value: Any) -> list[str]:
+    result: list[str] = []
+    if not isinstance(value, list):
+        return result
+    for part in value:
+        if not isinstance(part, dict):
+            continue
+        artist = part.get("artist")
+        if isinstance(artist, dict):
+            mbid = plain(artist.get("id"))
+            if mbid:
+                result.append(mbid)
+    return result
+
+
+def get_easy(audio: Any, key: str) -> str:
+    if audio is None or not getattr(audio, "tags", None):
+        return ""
+    try:
+        return plain(audio.tags.get(key, []))
+    except Exception:
+        return ""
+
+
+def strip_track_prefix(value: str) -> str:
+    return re.sub(
+        r"^[\s._-]*(?:(?:track|trk)\s*)?\d{1,4}[\s._-]+",
+        "",
+        value,
+        flags=re.IGNORECASE,
+    ).strip()
+
+
+def filename_track_number(path: Path) -> int | None:
+    match = re.match(
+        r"^[\s._-]*(?:(?:track|trk)\s*)?(\d{1,3})[\s._-]+",
+        path.stem,
+        re.IGNORECASE,
+    )
+    if not match:
+        return None
+    try:
+        return int(match.group(1))
+    except ValueError:
+        return None
+
+
+def tag_track_number(audio: Any) -> int | None:
+    raw = get_easy(audio, "tracknumber")
+    match = re.match(r"^\s*(\d+)", raw)
+    if not match:
+        return None
+    try:
+        return int(match.group(1))
+    except ValueError:
+        return None
+
+
+def local_info(path: Path, index: int) -> dict[str, Any] | None:
+    try:
+        audio = MutagenFile(path, easy=True)
+    except Exception:
+        return None
+    if audio is None:
+        return None
+
+    title = get_easy(audio, "title")
+    if missing(title):
+        title = humanize(strip_track_prefix(path.stem))
+
+    artist = get_easy(audio, "artist")
+    album = get_easy(audio, "album")
+    albumartist = get_easy(audio, "albumartist")
+
+    try:
+        duration = float(audio.info.length)
+    except Exception:
+        duration = 0.0
+
+    return {
+        "id": index,
+        "path": path,
+        "audio": audio,
+        "title": humanize(title),
+        "artist": humanize(artist),
+        "album": humanize(album),
+        "albumartist": humanize(albumartist),
+        # File numbering is only weak evidence. Downloader ordering can differ
+        # from MusicBrainz ordering, as in the user's "На палёном" example.
+        "number": tag_track_number(audio) or filename_track_number(path),
+        "duration": duration,
+    }
+
+
+def request_json(url: str, params: dict[str, Any]) -> dict[str, Any] | None:
+    global last_request, failures
+
+    if failures >= MAX_FAILURES:
+        return None
+
+    delay = REQUEST_INTERVAL - (time.monotonic() - last_request)
+    if delay > 0:
+        time.sleep(delay)
+
+    try:
+        response = http.get(url, params=params, timeout=REQUEST_TIMEOUT)
+        last_request = time.monotonic()
+
+        if response.status_code in {429, 503}:
+            failures += 1
+            time.sleep(min(3 * failures, 10))
+            return None
+
+        response.raise_for_status()
+        failures = 0
+        data = response.json()
+        return data if isinstance(data, dict) else None
+    except Exception as exc:
+        last_request = time.monotonic()
+        failures += 1
+        print(f"ALBUM-WARN: MusicBrainz request failed: {exc}")
+        return None
+
+
+def lucene_quote(value: str) -> str:
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def title_variants(title: str) -> list[str]:
+    words = humanize(title).split()
+    result: list[str] = []
+
+    def add(parts: list[str]) -> None:
+        value = humanize(" ".join(parts))
+        if len(value) >= 2 and value not in result:
+            result.append(value)
+
+    add(words)
+    # Downloader filenames often append a source/remix/comment suffix.
+    if len(words) >= 3:
+        add(words[:-1])
+        add(words[:2])
+    if len(words) >= 4:
+        add(words[:-2])
+        add(words[:3])
+    return result[:4]
+
+
+def search_recordings(title: str, artist: str) -> list[dict[str, Any]]:
+    key = (norm(title), norm(artist))
+    if key in recording_cache:
+        return recording_cache[key]
+
+    query = f'recording:"{lucene_quote(title)}"'
+    if artist and not missing(artist):
+        query += f' AND artist:"{lucene_quote(artist)}"'
+
+    data = request_json(
+        f"{MB_BASE}/recording/",
+        {
+            "query": query,
+            "fmt": "json",
+            "limit": MAX_RECORDING_RESULTS,
+        },
+    )
+    rows = data.get("recordings", []) if data else []
+    result = [row for row in rows if isinstance(row, dict)]
+    recording_cache[key] = result
+    return result
+
+
+def release_detail(release_id: str) -> dict[str, Any] | None:
+    if release_id in release_cache:
+        return release_cache[release_id]
+
+    data = request_json(
+        f"{MB_BASE}/release/{release_id}",
+        {
+            "inc": "recordings+artist-credits+release-groups+genres+tags",
+            "fmt": "json",
+        },
+    )
+    if data is None and failures < MAX_FAILURES:
+        data = request_json(
+            f"{MB_BASE}/release/{release_id}",
+            {
+                "inc": "recordings+artist-credits+release-groups",
+                "fmt": "json",
+            },
+        )
+    release_cache[release_id] = data
+    return data
+
+
+def duration_score(local_seconds: float, remote_ms: Any) -> tuple[float, float]:
+    try:
+        remote_seconds = float(remote_ms) / 1000.0
+    except (TypeError, ValueError):
+        return 0.50, 9999.0
+
+    if local_seconds <= 0 or remote_seconds <= 0:
+        return 0.50, 9999.0
+
+    diff = abs(local_seconds - remote_seconds)
+    if diff <= 1.5:
+        return 1.0, diff
+    if diff <= 4:
+        return 0.94, diff
+    if diff <= 8:
+        return 0.80, diff
+    if diff <= 15:
+        return 0.50, diff
+    if diff <= 25:
+        return 0.18, diff
+    return 0.0, diff
+
+
+def recording_evidence(
+    local: dict[str, Any],
+    query_title: str,
+    row: dict[str, Any],
+) -> float:
+    title_sim = similarity(query_title, row.get("title"))
+    overlap = token_overlap(query_title, row.get("title"))
+    dur_score, _ = duration_score(local["duration"], row.get("length"))
+
+    remote_artist = artist_credit(row.get("artist-credit"))
+    if local["artist"] and not missing(local["artist"]):
+        artist_sim = similarity(local["artist"], remote_artist)
+        artist_weight = 0.13
+    else:
+        artist_sim = 0.60
+        artist_weight = 0.05
+
+    try:
+        mb_score = min(1.0, max(0.0, float(row.get("score", 0) or 0) / 100.0))
+    except (TypeError, ValueError):
+        mb_score = 0.0
+
+    return (
+        0.41 * title_sim
+        + 0.18 * overlap
+        + 0.23 * dur_score
+        + artist_weight * artist_sim
+        + (0.13 if artist_weight == 0.05 else 0.05) * mb_score
+    )
+
+
+def discover_release_support(
+    locals_: list[dict[str, Any]],
+) -> dict[str, dict[int, float]]:
+    support: dict[str, dict[int, float]] = defaultdict(dict)
+
+    for pos, local in enumerate(locals_, start=1):
+        if failures >= MAX_FAILURES:
+            break
+
+        title = local["title"]
+        if not title or missing(title):
+            continue
+
+        best_local_evidence = 0.0
+        artist = local["artist"] if not missing(local["artist"]) else ""
+
+        for query_title in title_variants(title):
+            rows = search_recordings(query_title, artist)
+            ranked: list[tuple[float, dict[str, Any]]] = []
+
+            for row in rows:
+                evidence = recording_evidence(local, query_title, row)
+                if evidence >= 0.66:
+                    ranked.append((evidence, row))
+
+            ranked.sort(key=lambda item: item[0], reverse=True)
+
+            for evidence, row in ranked[:4]:
+                best_local_evidence = max(best_local_evidence, evidence)
+                releases = row.get("releases")
+                if not isinstance(releases, list):
+                    continue
+                # A recording can occur on many compilations. Limit the fan-out;
+                # release-level scoring below will decide which shared release
+                # actually explains several files together.
+                for release in releases[:8]:
+                    if not isinstance(release, dict):
+                        continue
+                    release_id = plain(release.get("id"))
+                    if not release_id:
+                        continue
+                    previous = support[release_id].get(local["id"], 0.0)
+                    support[release_id][local["id"]] = max(previous, evidence)
+
+            if best_local_evidence >= 0.91:
+                break
+
+        if pos % 25 == 0:
+            print(
+                f"ALBUM-DISCOVERY: searched {pos}/{len(locals_)} tracks; "
+                f"release candidates={len(support)}"
+            )
+
+    return support
+
+
+def remote_tracks(detail: dict[str, Any]) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    media = detail.get("media")
+    if not isinstance(media, list):
+        return result
+
+    for disc_index, medium in enumerate(media, start=1):
+        if not isinstance(medium, dict):
+            continue
+        raw_tracks = medium.get("tracks")
+        if not isinstance(raw_tracks, list):
+            continue
+
+        disc = int(medium.get("position") or disc_index)
+
+        for index, track in enumerate(raw_tracks, start=1):
+            if not isinstance(track, dict):
+                continue
+            recording = track.get("recording")
+            if not isinstance(recording, dict):
+                recording = {}
+
+            try:
+                number = int(track.get("position") or index)
+            except (TypeError, ValueError):
+                number = index
+
+            length = track.get("length") or recording.get("length")
+
+            result.append({
+                "id": f"{disc}:{number}",
+                "number": number,
+                "disc": disc,
+                "title": plain(track.get("title")) or plain(recording.get("title")),
+                "artist": artist_credit(track.get("artist-credit"))
+                    or artist_credit(recording.get("artist-credit"))
+                    or artist_credit(detail.get("artist-credit")),
+                "artist_ids": artist_ids(
+                    track.get("artist-credit")
+                    or recording.get("artist-credit")
+                    or detail.get("artist-credit")
+                ),
+                "recording_id": plain(recording.get("id")),
+                "length": length,
+            })
+    return result
+
+
+def title_match(local_title: str, remote_title: str) -> float:
+    sim = similarity(local_title, remote_title)
+    overlap = token_overlap(local_title, remote_title)
+    left = norm(local_title)
+    right = norm(remote_title)
+    containment = 1.0 if left and right and (left in right or right in left) else 0.0
+    return max(sim, 0.72 * overlap + 0.28 * containment)
+
+
+def pair_score(local: dict[str, Any], remote: dict[str, Any]) -> tuple[float, float]:
+    title_score = title_match(local["title"], remote["title"])
+    dur_score, dur_diff = duration_score(local["duration"], remote["length"])
+
+    if local["artist"] and not missing(local["artist"]):
+        artist_score = similarity(local["artist"], remote["artist"])
+    else:
+        artist_score = 0.62
+
+    # Numeric prefixes are deliberately weak evidence: source ordering and
+    # MusicBrainz ordering can differ.
+    if local["number"] is None:
+        number_score = 0.55
+    elif local["number"] == remote["number"]:
+        number_score = 1.0
+    else:
+        number_score = 0.40
+
+    total = (
+        0.61 * title_score
+        + 0.24 * dur_score
+        + 0.11 * artist_score
+        + 0.04 * number_score
+    )
+
+    # Prevent a duration coincidence from pairing completely unrelated titles.
+    if title_score < 0.48:
+        total *= 0.55
+
+    return total, dur_diff
+
+
+def greedy_map(
+    locals_: list[dict[str, Any]],
+    remotes: list[dict[str, Any]],
+    allowed_local_ids: set[int] | None = None,
+) -> list[tuple[dict[str, Any], dict[str, Any], float]]:
+    pairs: list[tuple[float, dict[str, Any], dict[str, Any]]] = []
+
+    for local in locals_:
+        if allowed_local_ids is not None and local["id"] not in allowed_local_ids:
+            continue
+        for remote in remotes:
+            score, dur_diff = pair_score(local, remote)
+            if score < MIN_PAIR_SCORE:
+                continue
+            # Weak title matches require a close duration.
+            if title_match(local["title"], remote["title"]) < 0.62 and dur_diff > 4:
+                continue
+            pairs.append((score, local, remote))
+
+    pairs.sort(key=lambda row: row[0], reverse=True)
+
+    used_local: set[int] = set()
+    used_remote: set[str] = set()
+    result: list[tuple[dict[str, Any], dict[str, Any], float]] = []
+
+    for score, local, remote in pairs:
+        if local["id"] in used_local or remote["id"] in used_remote:
+            continue
+        used_local.add(local["id"])
+        used_remote.add(remote["id"])
+        result.append((local, remote, score))
+
+    return result
+
+
+def release_group_info(detail: dict[str, Any]) -> tuple[str, bool, str]:
+    release_group = detail.get("release-group")
+    if not isinstance(release_group, dict):
+        return "", False, ""
+
+    rg_id = plain(release_group.get("id"))
+    primary = plain(release_group.get("primary-type")).casefold()
+    raw_secondary = release_group.get("secondary-types")
+    secondary = (
+        [plain(value).casefold() for value in raw_secondary]
+        if isinstance(raw_secondary, list)
+        else []
+    )
+    compilation = "compilation" in secondary
+    return rg_id, compilation, primary
+
+
+def candidate_metrics(
+    detail: dict[str, Any],
+    locals_: list[dict[str, Any]],
+    support_ids: set[int],
+) -> dict[str, Any] | None:
+    remotes = remote_tracks(detail)
+    if not remotes:
+        return None
+
+    # Search all local files, not just the search anchors. This lets three
+    # distinctive titles discover the release and then maps the rest of the
+    # album even when every file is mixed in one directory with unrelated music.
+    mapped = greedy_map(locals_, remotes)
+    if len(mapped) < MIN_CLUSTER_TRACKS:
+        return None
+
+    avg = sum(row[2] for row in mapped) / len(mapped)
+    coverage = len(mapped) / max(1, len(remotes))
+    supported_mapped = sum(
+        1 for local, _, _ in mapped if local["id"] in support_ids
+    )
+    support_ratio = supported_mapped / max(1, len(mapped))
+
+    rg_id, compilation, primary = release_group_info(detail)
+
+    albumartist = artist_credit(detail.get("artist-credit"))
+    mapped_artists = [
+        local["artist"]
+        for local, _, _ in mapped
+        if local["artist"] and not missing(local["artist"])
+    ]
+    if mapped_artists and albumartist and norm(albumartist) != "various artists":
+        artist_consistency = sum(
+            similarity(value, albumartist) >= 0.60 for value in mapped_artists
+        ) / len(mapped_artists)
+    else:
+        artist_consistency = 0.65
+
+    score = (
+        0.53 * avg
+        + 0.20 * min(1.0, coverage / 0.65)
+        + 0.14 * min(1.0, len(mapped) / 6.0)
+        + 0.08 * support_ratio
+        + 0.05 * artist_consistency
+    )
+
+    if compilation:
+        score -= 0.07
+    if norm(albumartist) == "various artists":
+        score -= 0.03
+
+    # Prefer ordinary album/single/EP concepts over miscellaneous release types.
+    if primary in {"album", "single", "ep"}:
+        score += 0.015
+
+    if avg < MIN_CLUSTER_AVG or coverage < MIN_CLUSTER_COVERAGE:
+        return None
+
+    # A 15-track album can be recognized from a partial batch, but not from
+    # only a couple of accidental matches.
+    required_tracks = 3
+    if len(remotes) >= 10:
+        required_tracks = 4
+    if len(remotes) >= 18:
+        required_tracks = 5
+    if len(mapped) < required_tracks:
+        return None
+
+    return {
+        "detail": detail,
+        "mapped": mapped,
+        "score": score,
+        "avg": avg,
+        "coverage": coverage,
+        "support_ratio": support_ratio,
+        "rg_id": rg_id or plain(detail.get("id")),
+        "compilation": compilation,
+        "primary": primary,
+    }
+
+
+def safe_component(value: str) -> str:
+    value = humanize(value)
+    value = re.sub(r'[\\/:*?"<>|]+', "_", value)
+    value = value.strip(" .")
+    return value[:120] or "Unknown"
+
+
+def set_tag(audio: Any, key: str, value: str) -> bool:
+    if not value:
+        return False
+    if getattr(audio, "tags", None) is None:
+        try:
+            audio.add_tags()
+        except Exception:
+            pass
+    try:
+        audio.tags[key] = [value]
+        return True
+    except Exception:
+        try:
+            audio[key] = value
+            return True
+        except Exception:
+            return False
+
+
+def set_missing_tag(audio: Any, key: str, value: str) -> bool:
+    if not value:
+        return False
+    current = get_easy(audio, key)
+    if not missing(current):
+        return False
+    return set_tag(audio, key, value)
+
+
+def release_year(detail: dict[str, Any]) -> str:
+    date = plain(detail.get("date"))
+    match = re.match(r"^(\d{4})", date)
+    return match.group(1) if match else date
+
+
+def collect_genres(detail: dict[str, Any]) -> str:
+    values: list[tuple[int, str]] = []
+
+    def take(raw: Any) -> None:
+        if not isinstance(raw, list):
+            return
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            name = plain(item.get("name"))
+            if not name:
+                continue
+            try:
+                count = int(item.get("count", 0) or 0)
+            except (TypeError, ValueError):
+                count = 0
+            values.append((count, name))
+
+    take(detail.get("genres"))
+    release_group = detail.get("release-group")
+    if not values and isinstance(release_group, dict):
+        take(release_group.get("genres"))
+        if not values:
+            take(release_group.get("tags"))
+    if not values:
+        take(detail.get("tags"))
+
+    seen: set[str] = set()
+    result: list[str] = []
+    for _, name in sorted(values, key=lambda row: (row[0], row[1]), reverse=True):
+        key = name.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(name)
+        if len(result) >= 3:
+            break
+    return "; ".join(result)
+
+
+def download_cover(destination: Path, release_id: str) -> bool:
+    # Keep an uploaded/local cover when it exists.
+    for name in ("cover.jpg", "cover.jpeg", "cover.png", "folder.jpg", "front.jpg"):
+        path = destination / name
+        if path.exists() and path.stat().st_size > 4096:
+            return True
+
+    try:
+        response = http.get(
+            f"{CAA_BASE}/release/{release_id}/front-500",
+            timeout=20,
+            allow_redirects=True,
+            headers={"User-Agent": USER_AGENT, "Accept": "image/*"},
+        )
+        if response.status_code == 404:
+            return False
+        response.raise_for_status()
+
+        content_type = response.headers.get("Content-Type", "").casefold()
+        if len(response.content) < 4096 or not content_type.startswith("image/"):
+            return False
+
+        suffix = ".png" if "png" in content_type else ".jpg"
+        target = destination / f"cover{suffix}"
+        temp = destination / f".cover{suffix}.tmp"
+        temp.write_bytes(response.content)
+        temp.replace(target)
+        return True
+    except Exception as exc:
+        print(f"ALBUM-WARN: cover art download failed: {exc}")
+        return False
+
+
+def move_unique(source: Path, destination: Path) -> Path:
+    destination.mkdir(parents=True, exist_ok=True)
+    target = destination / source.name
+    if source.resolve() == target.resolve():
+        return target
+
+    if target.exists():
+        stem = source.stem
+        suffix = source.suffix
+        counter = 2
+        while True:
+            candidate = destination / f"{stem}.{counter}{suffix}"
+            if not candidate.exists():
+                target = candidate
+                break
+            counter += 1
+
+    shutil.move(str(source), str(target))
+    return target
+
+
+def apply_cluster(
+    candidate: dict[str, Any],
+    album_root: Path,
+) -> set[int]:
+    detail = candidate["detail"]
+    mapped = candidate["mapped"]
+
+    release_id = plain(detail.get("id"))
+    album = plain(detail.get("title"))
+    albumartist = artist_credit(detail.get("artist-credit"))
+    year = release_year(detail)
+    genre = collect_genres(detail)
+
+    release_group = detail.get("release-group")
+    release_group_id = (
+        plain(release_group.get("id"))
+        if isinstance(release_group, dict)
+        else ""
+    )
+
+    destination = (
+        album_root
+        / "_matched"
+        / safe_component(
+            f"{albumartist or 'Various'} - {album} [{release_id[:8]}]"
+        )
+    )
+    destination.mkdir(parents=True, exist_ok=True)
+
+    assigned: set[int] = set()
+
+    for local, remote, score in mapped:
+        audio = local["audio"]
+        wrote = False
+
+        # Preserve existing useful artist/title/album tags. Network data is a
+        # gap-filler, not a replacement for embedded metadata or a filename
+        # that has already been confidently parsed.
+        current_title = get_easy(audio, "title")
+        raw_fallback = humanize(strip_track_prefix(local["path"].stem))
+        title_is_raw_filename = (
+            current_title
+            and not missing(current_title)
+            and norm(current_title) == norm(raw_fallback)
+        )
+
+        wrote |= set_missing_tag(
+            audio, "artist", remote["artist"] or albumartist
+        )
+
+        if missing(current_title):
+            wrote |= set_tag(audio, "title", remote["title"])
+        elif title_is_raw_filename:
+            # A group match is strong enough to resolve an unsplit filename.
+            wrote |= set_tag(audio, "title", remote["title"])
+
+        for key, value in (
+            ("album", album),
+            ("albumartist", albumartist),
+            ("date", year),
+            ("tracknumber", str(remote["number"])),
+            ("discnumber", str(remote["disc"])),
+            ("musicbrainz_trackid", remote["recording_id"]),
+            ("musicbrainz_albumid", release_id),
+            ("musicbrainz_releasegroupid", release_group_id),
+        ):
+            wrote |= set_missing_tag(audio, key, value)
+
+        if remote["artist_ids"]:
+            wrote |= set_missing_tag(
+                audio,
+                "musicbrainz_artistid",
+                remote["artist_ids"][0],
+            )
+        if genre:
+            wrote |= set_missing_tag(audio, "genre", genre)
+
+        if wrote:
+            try:
+                audio.save()
+            except Exception as exc:
+                print(f"ALBUM-WARN: cannot save tags for {local['path']}: {exc}")
+                continue
+
+        original = local["path"]
+        try:
+            new_path = move_unique(original, destination)
+        except Exception as exc:
+            print(f"ALBUM-WARN: cannot regroup {original}: {exc}")
+            continue
+
+        local["path"] = new_path
+        assigned.add(local["id"])
+        print(
+            f"ALBUM-TRACK: {original.name} -> "
+            f"{remote['artist'] or albumartist} — {remote['title']} "
+            f"[{album}] pair={score:.3f}"
+        )
+
+    cover_ok = download_cover(destination, release_id) if release_id else False
+    print(
+        f"ALBUM-COVER: {'downloaded/present' if cover_ok else 'not available'} "
+        f"for {albumartist!r} — {album!r}"
+    )
+    return assigned
+
+
+def collect_audio(roots: list[Path]) -> list[dict[str, Any]]:
+    paths: list[Path] = []
+    seen: set[str] = set()
+
+    for root in roots:
+        if not root.exists():
+            continue
+        candidates = [root] if root.is_file() else root.rglob("*")
+        for path in candidates:
+            if not path.is_file() or path.suffix.casefold() not in AUDIO_EXTENSIONS:
+                continue
+            try:
+                key = str(path.resolve())
+            except OSError:
+                key = str(path)
+            if key in seen:
+                continue
+            seen.add(key)
+            paths.append(path)
+
+    result: list[dict[str, Any]] = []
+    for index, path in enumerate(paths, start=1):
+        info = local_info(path, index)
+        if info is not None:
+            result.append(info)
+    return result
+
+
+def main() -> int:
+    if len(sys.argv) != 3:
+        print(
+            "usage: music-cloud-album-enrich ALBUM_ROOT SINGLES_ROOT",
+            file=sys.stderr,
+        )
+        return 2
+
+    album_root = Path(sys.argv[1])
+    singles_root = Path(sys.argv[2])
+    album_root.mkdir(parents=True, exist_ok=True)
+    singles_root.mkdir(parents=True, exist_ok=True)
+
+    locals_ = collect_audio([album_root, singles_root])
+    if len(locals_) < MIN_CLUSTER_TRACKS:
+        print("ALBUM-GROUPS-MATCHED=0")
+        return 0
+
+    print(
+        f"ALBUM-DISCOVERY: analysing {len(locals_)} files as one mixed pool; "
+        "folder names are optional."
+    )
+
+    support = discover_release_support(locals_)
+    if failures >= MAX_FAILURES:
+        print(
+            "ALBUM-WARN: MusicBrainz temporarily unavailable; "
+            "album clustering skipped for this batch."
+        )
+        print("ALBUM-GROUPS-MATCHED=0")
+        return 0
+
+    ranked_ids = sorted(
+        (
+            (
+                len(values),
+                sum(values.values()) / max(1, len(values)),
+                release_id,
+                set(values),
+            )
+            for release_id, values in support.items()
+            if len(values) >= MIN_RELEASE_SUPPORT
+        ),
+        reverse=True,
+    )
+
+    if not ranked_ids:
+        print("ALBUM-DISCOVERY: no release has support from 3+ different files.")
+        print("ALBUM-GROUPS-MATCHED=0")
+        return 0
+
+    candidates: list[dict[str, Any]] = []
+
+    for _, _, release_id, support_ids in ranked_ids[:MAX_RELEASE_DETAILS]:
+        detail = release_detail(release_id)
+        if not detail:
+            continue
+
+        metrics = candidate_metrics(detail, locals_, support_ids)
+        if metrics is not None:
+            candidates.append(metrics)
+
+        if failures >= MAX_FAILURES:
+            break
+
+    if not candidates:
+        print("ALBUM-DISCOVERY: release candidates did not pass group validation.")
+        print("ALBUM-GROUPS-MATCHED=0")
+        return 0
+
+    # Different releases of the same release-group usually contain essentially
+    # the same album. Pick the best edition inside each release-group first.
+    best_by_rg: dict[str, dict[str, Any]] = {}
+    for candidate in candidates:
+        rg_id = candidate["rg_id"]
+        current = best_by_rg.get(rg_id)
+        if current is None or candidate["score"] > current["score"]:
+            best_by_rg[rg_id] = candidate
+
+    candidates = sorted(
+        best_by_rg.values(),
+        key=lambda value: (
+            value["score"],
+            len(value["mapped"]),
+            value["coverage"],
+            value["avg"],
+        ),
+        reverse=True,
+    )
+
+    assigned: set[int] = set()
+    matched_groups = 0
+
+    for index, candidate in enumerate(candidates):
+        # Re-map against files that were not already claimed by a stronger
+        # release cluster.
+        available = [local for local in locals_ if local["id"] not in assigned]
+        remotes = remote_tracks(candidate["detail"])
+        remapped = greedy_map(available, remotes)
+
+        if len(remapped) < MIN_CLUSTER_TRACKS:
+            continue
+
+        avg = sum(row[2] for row in remapped) / len(remapped)
+        coverage = len(remapped) / max(1, len(remotes))
+        if avg < MIN_CLUSTER_AVG or coverage < MIN_CLUSTER_COVERAGE:
+            continue
+
+        required = 3
+        if len(remotes) >= 10:
+            required = 4
+        if len(remotes) >= 18:
+            required = 5
+        if len(remapped) < required:
+            continue
+
+        # If a different release-group explains essentially the same files with
+        # an almost identical score, do not guess. Same-RG edition ambiguity was
+        # already resolved above and is harmless for artist/title metadata.
+        local_ids = {row[0]["id"] for row in remapped}
+        ambiguous = False
+        for other in candidates[index + 1 : index + 4]:
+            other_ids = {row[0]["id"] for row in other["mapped"]}
+            overlap = len(local_ids & other_ids) / max(1, len(local_ids | other_ids))
+            if (
+                overlap >= 0.65
+                and candidate["score"] - other["score"] < MIN_RG_MARGIN
+            ):
+                ambiguous = True
+                break
+
+        if ambiguous and candidate["score"] < 0.90:
+            print(
+                f"ALBUM-SKIP: ambiguous release group for "
+                f"{len(remapped)} files; score={candidate['score']:.3f}"
+            )
+            continue
+
+        candidate = dict(candidate)
+        candidate["mapped"] = remapped
+
+        detail = candidate["detail"]
+        print(
+            f"ALBUM-MATCH: {artist_credit(detail.get('artist-credit'))!r} — "
+            f"{plain(detail.get('title'))!r}; "
+            f"mapped={len(remapped)}/{len(remotes)}, "
+            f"avg={avg:.3f}, score={candidate['score']:.3f}, "
+            f"release={plain(detail.get('id'))}"
+        )
+
+        claimed = apply_cluster(candidate, album_root)
+        if claimed:
+            assigned.update(claimed)
+            matched_groups += 1
+
+    print(f"ALBUM-GROUPS-MATCHED={matched_groups}")
+    print(f"ALBUM-TRACKS-REGROUPED={len(assigned)}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+PYMUSICCLOUDALBUM
+
+    chmod 0755 "${ALBUM_ENRICH_SCRIPT}"
+    "${BEETS_VENV}/bin/python" -m py_compile "${ALBUM_ENRICH_SCRIPT}"
+
     cat > "${ONLINE_ENRICH_SCRIPT}" <<'PYMUSICCLOUDONLINE'
 #!/opt/music-cloud/beets-venv/bin/python
 from __future__ import annotations
@@ -3429,22 +4506,28 @@ AUDIO_EXTENSIONS = {
     ".aif", ".aiff", ".alac", ".wma", ".ape", ".mpc", ".tta", ".dsf", ".dff",
 }
 PLACEHOLDERS = {
-    "", "unknown", "unknown artist", "unknown title", "unknown track",
-    "untitled", "none", "n/a", "na", "<unknown>", "(unknown)",
-    "singles", "singles.1", "00-00", "0",
+    "", "unknown", "unknown artist", "unknown album", "unknown title",
+    "unknown track", "untitled", "none", "n/a", "na", "<unknown>",
+    "(unknown)", "singles", "singles.1", "00-00", "0",
 }
 
-MB_URL = "https://musicbrainz.org/ws/2/recording/"
-USER_AGENT = "MusicCloud/5.3.0 (https://github.com/hase9awa/music-cloud)"
+MB_BASE = "https://musicbrainz.org/ws/2"
+USER_AGENT = "MusicCloud/5.6.0 (https://github.com/hase9awa/music-cloud)"
 REQUEST_INTERVAL = 1.10
-REQUEST_TIMEOUT = 12
+REQUEST_TIMEOUT = 15
 MAX_FAILURES = 3
+MIN_MARGIN = 0.08
 
 http = requests.Session()
-http.headers.update({"User-Agent": USER_AGENT, "Accept": "application/json"})
+http.headers.update({
+    "User-Agent": USER_AGENT,
+    "Accept": "application/json",
+})
+
 last_request = 0.0
 failures = 0
-cache: dict[str, list[dict[str, Any]]] = {}
+search_cache: dict[tuple[str, str], list[dict[str, Any]]] = {}
+release_cache: dict[str, dict[str, Any] | None] = {}
 
 
 def plain(value: object) -> str:
@@ -3456,23 +4539,53 @@ def plain(value: object) -> str:
 def humanize(value: str) -> str:
     value = unicodedata.normalize("NFKC", value)
     value = re.sub(r"[_\s]+", " ", value)
+    value = re.sub(r"\s*,\s*", ", ", value)
     return value.strip(" ._-–—")
 
 
 def norm(value: object) -> str:
-    value = humanize(plain(value)).casefold()
-    value = re.sub(r"[^\w]+", " ", value, flags=re.UNICODE)
-    return re.sub(r"\s+", " ", value).strip()
+    text = humanize(plain(value)).casefold()
+    text = re.sub(r"[^\w]+", " ", text, flags=re.UNICODE)
+    return re.sub(r"\s+", " ", text).strip()
 
 
 def missing(value: object) -> bool:
     return norm(value) in PLACEHOLDERS
 
 
+def similarity(a: object, b: object) -> float:
+    left = norm(a)
+    right = norm(b)
+    if not left or not right:
+        return 0.0
+    return SequenceMatcher(None, left, right).ratio()
+
+
+def token_overlap(a: object, b: object) -> float:
+    left = set(norm(a).split())
+    right = set(norm(b).split())
+    if not left or not right:
+        return 0.0
+    return len(left & right) / max(len(left), len(right))
+
+
+def strip_track_prefix(value: str) -> str:
+    return re.sub(
+        r"^[\s._-]*(?:(?:track|trk)\s*)?\d{1,4}[\s._-]+",
+        "",
+        value,
+        flags=re.IGNORECASE,
+    ).strip()
+
+
+def filename_fallback_title(path: Path) -> str:
+    return humanize(strip_track_prefix(path.stem)) or path.stem
+
+
 def artist_credit(value: Any) -> str:
     if not isinstance(value, list):
         return ""
-    out: list[str] = []
+    result: list[str] = []
     for part in value:
         if not isinstance(part, dict):
             continue
@@ -3480,199 +4593,130 @@ def artist_credit(value: Any) -> str:
         if not name and isinstance(part.get("artist"), dict):
             name = plain(part["artist"].get("name"))
         if name:
-            out.append(name)
-        join = plain(part.get("joinphrase"))
-        if join:
-            out.append(join)
-    return "".join(out).strip()
+            result.append(name)
+        joinphrase = plain(part.get("joinphrase"))
+        if joinphrase:
+            result.append(joinphrase)
+    return "".join(result).strip()
 
 
-def variants(title: str) -> list[str]:
-    words = humanize(title).split()
+def artist_ids(value: Any) -> list[str]:
     result: list[str] = []
-
-    def add(value: str) -> None:
-        value = humanize(value)
-        if len(value) >= 2 and value not in result:
-            result.append(value)
-
-    add(" ".join(words))
-    if len(words) >= 3:
-        # Downloader/source names often have one extra suffix that is not part
-        # of the canonical recording title.
-        add(" ".join(words[:-1]))
-        add(" ".join(words[:2]))
-        add(" ".join(words[-2:]))
-    if len(words) >= 4:
-        add(" ".join(words[:-2]))
-    return result[:5]
+    if not isinstance(value, list):
+        return result
+    for part in value:
+        if not isinstance(part, dict):
+            continue
+        artist = part.get("artist")
+        if isinstance(artist, dict):
+            mbid = plain(artist.get("id"))
+            if mbid:
+                result.append(mbid)
+    return result
 
 
-def request_search(title: str) -> list[dict[str, Any]]:
+def request_json(url: str, params: dict[str, Any]) -> dict[str, Any] | None:
     global last_request, failures
 
-    key = norm(title)
-    if key in cache:
-        return cache[key]
     if failures >= MAX_FAILURES:
-        return []
+        return None
 
     delay = REQUEST_INTERVAL - (time.monotonic() - last_request)
     if delay > 0:
         time.sleep(delay)
 
-    escaped = title.replace("\\", "\\\\").replace('"', '\\"')
     try:
-        response = http.get(
-            MB_URL,
-            params={
-                "query": f'recording:"{escaped}"',
-                "fmt": "json",
-                "limit": 10,
-            },
-            timeout=REQUEST_TIMEOUT,
-        )
+        response = http.get(url, params=params, timeout=REQUEST_TIMEOUT)
         last_request = time.monotonic()
+
         if response.status_code in {429, 503}:
             failures += 1
-            cache[key] = []
-            return []
+            time.sleep(min(3 * failures, 10))
+            return None
+
         response.raise_for_status()
         failures = 0
         data = response.json()
+        return data if isinstance(data, dict) else None
     except Exception as exc:
         last_request = time.monotonic()
         failures += 1
-        print(f"ONLINE-WARN: MusicBrainz: {exc}")
-        cache[key] = []
-        return []
+        print(f"ONLINE-WARN: MusicBrainz request failed: {exc}")
+        return None
 
-    rows = data.get("recordings", []) if isinstance(data, dict) else []
+
+def lucene_quote(value: str) -> str:
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def search_recordings(title: str, artist: str) -> list[dict[str, Any]]:
+    key = (norm(title), norm(artist))
+    if key in search_cache:
+        return search_cache[key]
+
+    query = f'recording:"{lucene_quote(title)}"'
+    if artist and not missing(artist):
+        query += f' AND artist:"{lucene_quote(artist)}"'
+
+    data = request_json(
+        f"{MB_BASE}/recording/",
+        {
+            "query": query,
+            "fmt": "json",
+            "limit": 10,
+        },
+    )
+    rows = data.get("recordings", []) if data else []
     result = [row for row in rows if isinstance(row, dict)]
-    cache[key] = result
+    search_cache[key] = result
     return result
 
 
-def score(query: str, duration: float, row: dict[str, Any]) -> tuple[float, float]:
-    q = norm(query)
-    title = norm(row.get("title"))
-    if not q or not title:
-        return 0.0, 9999.0
+def release_detail(release_id: str) -> dict[str, Any] | None:
+    if release_id in release_cache:
+        return release_cache[release_id]
 
-    similarity = SequenceMatcher(None, q, title).ratio()
-    qtokens = set(q.split())
-    ttokens = set(title.split())
-    overlap = len(qtokens & ttokens) / max(len(qtokens), len(ttokens))
-
-    try:
-        mb_score = float(row.get("score", 0) or 0) / 100.0
-    except (TypeError, ValueError):
-        mb_score = 0.0
-
-    try:
-        candidate_duration = float(row.get("length")) / 1000.0
-        diff = abs(duration - candidate_duration)
-        duration_score = max(0.0, 1.0 - diff / 18.0)
-    except (TypeError, ValueError):
-        diff = 9999.0
-        duration_score = 0.25
-
-    total = (
-        0.44 * similarity
-        + 0.20 * overlap
-        + 0.26 * duration_score
-        + 0.10 * mb_score
+    data = request_json(
+        f"{MB_BASE}/release/{release_id}",
+        {
+            "inc": "recordings+artist-credits+release-groups+genres+tags",
+            "fmt": "json",
+        },
     )
-    return total, diff
-
-
-def choose(title: str, duration: float) -> tuple[dict[str, Any], float, str] | None:
-    found: dict[str, tuple[float, float, dict[str, Any], str]] = {}
-
-    for query in variants(title):
-        for row in request_search(query):
-            mbid = plain(row.get("id"))
-            if not mbid:
-                continue
-
-            value, diff = score(query, duration, row)
-            title_sim = SequenceMatcher(None, norm(query), norm(row.get("title"))).ratio()
-            qtokens = set(norm(query).split())
-            rtokens = set(norm(row.get("title")).split())
-            overlap = len(qtokens & rtokens) / max(1, max(len(qtokens), len(rtokens)))
-
-            # Unknown-artist search is intentionally conservative:
-            # title words must substantially agree and duration must be close.
-            if value < 0.78 or title_sim < 0.62 or overlap < 0.50 or diff > 8.0:
-                continue
-
-            old = found.get(mbid)
-            candidate = (value, diff, row, query)
-            if old is None or value > old[0]:
-                found[mbid] = candidate
-
-        if found and max(value[0] for value in found.values()) >= 0.93:
-            break
-        if failures >= MAX_FAILURES:
-            break
-
-    if not found:
-        return None
-
-    ranked = sorted(found.values(), key=lambda item: item[0], reverse=True)
-    if len(ranked) > 1 and ranked[0][0] - ranked[1][0] < 0.06:
-        return None
-
-    return ranked[0][2], ranked[0][0], ranked[0][3]
-
-
-def best_release(row: dict[str, Any]) -> dict[str, Any] | None:
-    releases = row.get("releases")
-    if not isinstance(releases, list):
-        return None
-
-    valid = [r for r in releases if isinstance(r, dict) and plain(r.get("id"))]
-    if not valid:
-        return None
-
-    def key(release: dict[str, Any]) -> tuple[int, int, int, str]:
-        status = plain(release.get("status")).casefold()
-        rg = release.get("release-group")
-        primary = ""
-        secondary: list[str] = []
-        if isinstance(rg, dict):
-            primary = plain(rg.get("primary-type")).casefold()
-            raw = rg.get("secondary-types")
-            if isinstance(raw, list):
-                secondary = [plain(x).casefold() for x in raw]
-        return (
-            -int(status == "official"),
-            -int("compilation" not in secondary),
-            -int(primary in {"album", "single", "ep"}),
-            plain(release.get("date")) or "9999",
+    if data is None and failures < MAX_FAILURES:
+        data = request_json(
+            f"{MB_BASE}/release/{release_id}",
+            {
+                "inc": "recordings+artist-credits+release-groups",
+                "fmt": "json",
+            },
         )
+    release_cache[release_id] = data
+    return data
 
-    valid.sort(key=key)
-    return valid[0]
 
-
-def get_values(audio: Any) -> tuple[str, str]:
-    if not getattr(audio, "tags", None):
-        return "", ""
+def get_tag(audio: Any, key: str) -> str:
+    if audio is None or not getattr(audio, "tags", None):
+        return ""
     try:
-        artist = plain(audio.tags.get("artist", []))
+        return plain(audio.tags.get(key, []))
     except Exception:
-        artist = ""
+        return ""
+
+
+def ensure_tags(audio: Any) -> None:
+    if getattr(audio, "tags", None) is not None:
+        return
     try:
-        title = plain(audio.tags.get("title", []))
+        audio.add_tags()
     except Exception:
-        title = ""
-    return artist, title
+        pass
 
 
 def set_tag(audio: Any, key: str, value: str) -> bool:
     if not value:
         return False
+    ensure_tags(audio)
     try:
         audio.tags[key] = [value]
         return True
@@ -3684,6 +4728,353 @@ def set_tag(audio: Any, key: str, value: str) -> bool:
             return False
 
 
+def set_if_missing(audio: Any, key: str, value: str) -> bool:
+    if not value:
+        return False
+    current = get_tag(audio, key)
+    if not missing(current):
+        return False
+    return set_tag(audio, key, value)
+
+
+def duration_score(actual: float, remote_ms: Any) -> tuple[float, float]:
+    try:
+        remote = float(remote_ms) / 1000.0
+    except (TypeError, ValueError):
+        return 0.45, 9999.0
+
+    if actual <= 0 or remote <= 0:
+        return 0.45, 9999.0
+
+    diff = abs(actual - remote)
+    if diff <= 1.5:
+        return 1.0, diff
+    if diff <= 4:
+        return 0.94, diff
+    if diff <= 8:
+        return 0.80, diff
+    if diff <= 15:
+        return 0.48, diff
+    if diff <= 25:
+        return 0.12, diff
+    return 0.0, diff
+
+
+def filename_orientations(path: Path) -> list[tuple[str, str, str]]:
+    """Return filename candidates as (artist, title, reason)."""
+    human = filename_fallback_title(path)
+    result: list[tuple[str, str, str]] = []
+
+    # Explicit spaced dash. Both conventions exist in real libraries:
+    #   Title - Artist
+    #   Artist - Title
+    # Do not guess locally; MusicBrainz+duration will disambiguate.
+    match = re.match(r"^(.+?)\s+(?:-|–|—)\s+(.+)$", human)
+    if match:
+        left = humanize(match.group(1))
+        right = humanize(match.group(2))
+        if left and right:
+            result.append((right, left, "filename:title-artist"))
+            result.append((left, right, "filename:artist-title"))
+
+    return result
+
+
+def source_candidates(
+    path: Path,
+    current_artist: str,
+    current_title: str,
+) -> list[tuple[str, str, str]]:
+    result: list[tuple[str, str, str]] = []
+
+    artist_ok = bool(current_artist and not missing(current_artist))
+    title_ok = bool(current_title and not missing(current_title))
+    fallback = filename_fallback_title(path)
+    title_is_raw_filename = title_ok and norm(current_title) == norm(fallback)
+
+    # Highest priority: embedded/preflight metadata. If artist+title are already
+    # meaningful, network is allowed to ENRICH them but not replace them.
+    if artist_ok and title_ok:
+        result.append((current_artist, current_title, "tags"))
+
+    # If the title is just the untouched filename and the dash is ambiguous,
+    # test both filename orientations. Network is only a disambiguator here;
+    # the final artist/title values still come from the filename sides.
+    if (not artist_ok or title_is_raw_filename) and filename_orientations(path):
+        result.extend(filename_orientations(path))
+
+    # Title-only fallback. This may fill a missing artist from MusicBrainz, but
+    # only under a strict confidence threshold.
+    if title_ok and not artist_ok:
+        result.append(("", current_title, "title-only"))
+
+    # De-duplicate preserving priority order.
+    unique: list[tuple[str, str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for artist, title, reason in result:
+        key = (norm(artist), norm(title))
+        if not title or key in seen:
+            continue
+        seen.add(key)
+        unique.append((artist, title, reason))
+    return unique
+
+
+def row_score(
+    source_artist: str,
+    source_title: str,
+    duration: float,
+    row: dict[str, Any],
+) -> tuple[float, dict[str, float]]:
+    remote_title = plain(row.get("title"))
+    remote_artist = artist_credit(row.get("artist-credit"))
+
+    title_sim = similarity(source_title, remote_title)
+    overlap = token_overlap(source_title, remote_title)
+    dur, diff = duration_score(duration, row.get("length"))
+
+    try:
+        mb_score = min(1.0, max(0.0, float(row.get("score", 0) or 0) / 100.0))
+    except (TypeError, ValueError):
+        mb_score = 0.0
+
+    if source_artist:
+        artist_sim = similarity(source_artist, remote_artist)
+        score = (
+            0.36 * title_sim
+            + 0.16 * overlap
+            + 0.23 * dur
+            + 0.20 * artist_sim
+            + 0.05 * mb_score
+        )
+    else:
+        artist_sim = 0.0
+        score = (
+            0.47 * title_sim
+            + 0.18 * overlap
+            + 0.28 * dur
+            + 0.07 * mb_score
+        )
+
+    return score, {
+        "title_sim": title_sim,
+        "overlap": overlap,
+        "duration_diff": diff,
+        "artist_sim": artist_sim,
+        "mb_score": mb_score,
+    }
+
+
+def safe_match(
+    source_artist: str,
+    source_title: str,
+    reason: str,
+    score: float,
+    metrics: dict[str, float],
+) -> bool:
+    title_sim = metrics["title_sim"]
+    overlap = metrics["overlap"]
+    diff = metrics["duration_diff"]
+    artist_sim = metrics["artist_sim"]
+
+    if reason == "tags":
+        # Existing tags are authoritative. A remote row must agree strongly
+        # before it is allowed to fill album/year/IDs.
+        return (
+            score >= 0.78
+            and title_sim >= 0.72
+            and artist_sim >= 0.72
+            and (diff == 9999.0 or diff <= 12)
+        )
+
+    if reason.startswith("filename:"):
+        return (
+            score >= 0.82
+            and title_sim >= 0.72
+            and artist_sim >= 0.76
+            and (diff == 9999.0 or diff <= 8)
+        )
+
+    # No artist: extremely conservative to avoid a plausible-but-wrong person.
+    word_count = len(norm(source_title).split())
+    if word_count <= 1:
+        return (
+            score >= 0.94
+            and title_sim >= 0.98
+            and diff != 9999.0
+            and diff <= 2
+        )
+
+    return (
+        score >= 0.88
+        and title_sim >= 0.82
+        and overlap >= 0.60
+        and diff != 9999.0
+        and diff <= 4
+    )
+
+
+def best_match(
+    path: Path,
+    artist: str,
+    title: str,
+    duration: float,
+) -> tuple[dict[str, Any], float, str, str, str] | None:
+    ranked: list[tuple[float, dict[str, Any], str, str, str]] = []
+
+    for source_artist, source_title, reason in source_candidates(
+        path, artist, title
+    ):
+        for row in search_recordings(source_title, source_artist):
+            score, metrics = row_score(
+                source_artist,
+                source_title,
+                duration,
+                row,
+            )
+            if not safe_match(
+                source_artist,
+                source_title,
+                reason,
+                score,
+                metrics,
+            ):
+                continue
+            ranked.append(
+                (score, row, source_artist, source_title, reason)
+            )
+
+    if not ranked:
+        return None
+
+    ranked.sort(key=lambda item: item[0], reverse=True)
+    best = ranked[0]
+    if len(ranked) > 1 and best[0] - ranked[1][0] < MIN_MARGIN:
+        # The same MusicBrainz recording can appear via both candidate
+        # orientations. That is not real ambiguity.
+        best_id = plain(best[1].get("id"))
+        second_id = plain(ranked[1][1].get("id"))
+        if not best_id or best_id != second_id:
+            return None
+
+    return best[1], best[0], best[2], best[3], best[4]
+
+
+def release_sort_key(release: dict[str, Any]) -> tuple[int, int, int, str]:
+    status = plain(release.get("status")).casefold()
+    group = release.get("release-group")
+    primary = ""
+    secondary: list[str] = []
+
+    if isinstance(group, dict):
+        primary = plain(group.get("primary-type")).casefold()
+        raw_secondary = group.get("secondary-types")
+        if isinstance(raw_secondary, list):
+            secondary = [plain(value).casefold() for value in raw_secondary]
+
+    return (
+        -int(status == "official"),
+        -int("compilation" not in secondary),
+        -int(primary in {"album", "single", "ep"}),
+        plain(release.get("date")) or "9999",
+    )
+
+
+def choose_release(row: dict[str, Any]) -> dict[str, Any] | None:
+    releases = row.get("releases")
+    if not isinstance(releases, list):
+        return None
+    valid = [
+        release for release in releases
+        if isinstance(release, dict) and plain(release.get("id"))
+    ]
+    if not valid:
+        return None
+    valid.sort(key=release_sort_key)
+    return valid[0]
+
+
+def find_track(
+    detail: dict[str, Any] | None,
+    recording_id: str,
+) -> tuple[str, str, str]:
+    if not detail:
+        return "", "", ""
+
+    media = detail.get("media")
+    if not isinstance(media, list):
+        return "", "", ""
+
+    for disc_index, medium in enumerate(media, start=1):
+        if not isinstance(medium, dict):
+            continue
+        tracks = medium.get("tracks")
+        if not isinstance(tracks, list):
+            continue
+
+        for track_index, track in enumerate(tracks, start=1):
+            if not isinstance(track, dict):
+                continue
+            recording = track.get("recording")
+            if not isinstance(recording, dict):
+                continue
+            if plain(recording.get("id")) != recording_id:
+                continue
+
+            number = plain(track.get("number")) or str(
+                track.get("position") or track_index
+            )
+            disc = plain(medium.get("position")) or str(disc_index)
+            track_title = plain(track.get("title"))
+            return number, disc, track_title
+
+    return "", "", ""
+
+
+def collect_genres(detail: dict[str, Any] | None) -> str:
+    if not detail:
+        return ""
+
+    values: list[tuple[int, str]] = []
+
+    def take(raw: Any) -> None:
+        if not isinstance(raw, list):
+            return
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            name = plain(item.get("name"))
+            if not name:
+                continue
+            try:
+                count = int(item.get("count", 0) or 0)
+            except (TypeError, ValueError):
+                count = 0
+            values.append((count, name))
+
+    take(detail.get("genres"))
+    group = detail.get("release-group")
+    if not values and isinstance(group, dict):
+        take(group.get("genres"))
+        if not values:
+            take(group.get("tags"))
+    if not values:
+        take(detail.get("tags"))
+
+    result: list[str] = []
+    seen: set[str] = set()
+    for _, name in sorted(values, key=lambda row: (row[0], row[1]), reverse=True):
+        key = name.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(name)
+        if len(result) >= 3:
+            break
+
+    return "; ".join(result)
+
+
 def process(path: Path) -> tuple[bool, str]:
     try:
         audio = MutagenFile(path, easy=True)
@@ -3692,59 +5083,144 @@ def process(path: Path) -> tuple[bool, str]:
     if audio is None:
         return False, "unsupported audio"
 
-    if getattr(audio, "tags", None) is None:
-        try:
-            audio.add_tags()
-        except Exception:
-            pass
+    ensure_tags(audio)
 
-    artist, title = get_values(audio)
+    current_artist = get_tag(audio, "artist")
+    current_title = get_tag(audio, "title")
+    current_album = get_tag(audio, "album")
+    current_albumartist = get_tag(audio, "albumartist")
+    current_date = get_tag(audio, "date")
+    current_track = get_tag(audio, "tracknumber")
+    current_disc = get_tag(audio, "discnumber")
+    current_genre = get_tag(audio, "genre")
+    current_mbid = get_tag(audio, "musicbrainz_trackid")
+    current_release_mbid = get_tag(audio, "musicbrainz_albumid")
 
-    # Existing artist+title goes through normal beets/AcoustID. Direct title-only
-    # MusicBrainz search is for the hard case seen with downloader filenames.
-    if not title or missing(title) or not missing(artist):
-        return False, "not title-only"
+    # Nothing to enrich.
+    if (
+        not missing(current_artist)
+        and not missing(current_title)
+        and not missing(current_album)
+        and not missing(current_date)
+        and current_mbid
+        and current_release_mbid
+    ):
+        return False, "metadata already complete"
 
     try:
         duration = float(audio.info.length)
     except Exception:
-        return False, "no duration"
+        duration = 0.0
 
-    match = choose(humanize(title), duration)
-    if not match:
+    match = best_match(
+        path,
+        current_artist,
+        current_title,
+        duration,
+    )
+    if match is None:
         return False, "no confident match"
 
-    row, confidence, used_query = match
-    canonical_title = plain(row.get("title"))
-    canonical_artist = artist_credit(row.get("artist-credit"))
-    release = best_release(row)
-
-    album = plain(release.get("title")) if release else ""
-    date = plain(release.get("date")) if release else ""
-    release_id = plain(release.get("id")) if release else ""
+    row, confidence, source_artist, source_title, reason = match
     recording_id = plain(row.get("id"))
+    remote_artist = artist_credit(row.get("artist-credit"))
+    remote_title = plain(row.get("title"))
 
-    changed: list[str] = []
-    for key, value in (
-        ("artist", canonical_artist),
-        ("title", canonical_title),
-        ("album", album),
-        ("albumartist", canonical_artist),
-        ("date", date[:4] if re.match(r"^\d{4}", date) else date),
-        ("musicbrainz_trackid", recording_id),
-        ("musicbrainz_albumid", release_id),
+    release = choose_release(row)
+    release_id = plain(release.get("id")) if release else ""
+    detail = release_detail(release_id) if release_id else None
+
+    album = ""
+    albumartist = ""
+    date = ""
+    track_number = ""
+    disc_number = ""
+    track_title = ""
+    genre = ""
+
+    if detail:
+        album = plain(detail.get("title"))
+        albumartist = artist_credit(detail.get("artist-credit"))
+        date = plain(detail.get("date"))
+        track_number, disc_number, track_title = find_track(
+            detail, recording_id
+        )
+        genre = collect_genres(detail)
+    elif release:
+        album = plain(release.get("title"))
+        date = plain(release.get("date"))
+
+    changes: list[str] = []
+
+    # Priority 1/2: do not overwrite useful tag/filename fields.
+    #
+    # The only exception is an ambiguous raw filename such as
+    # "Красота - Сёма Мишин": once MusicBrainz validates which side is artist,
+    # we split the filename. The values written still come from the filename,
+    # not from the remote spelling.
+    fallback = filename_fallback_title(path)
+    raw_title = (
+        current_title
+        and not missing(current_title)
+        and norm(current_title) == norm(fallback)
+    )
+
+    if missing(current_artist):
+        artist_value = source_artist or remote_artist
+        if artist_value and set_tag(audio, "artist", artist_value):
+            changes.append(f"artist={artist_value!r}")
+
+    if missing(current_title):
+        title_value = source_title or remote_title
+        if title_value and set_tag(audio, "title", title_value):
+            changes.append(f"title={title_value!r}")
+    elif raw_title and reason.startswith("filename:"):
+        if source_title and set_tag(audio, "title", source_title):
+            changes.append(f"title={source_title!r}")
+
+    # Priority 3: outside services only fill gaps.
+    for key, current, value in (
+        ("album", current_album, album),
+        (
+            "albumartist",
+            current_albumartist,
+            albumartist or source_artist or remote_artist,
+        ),
+        (
+            "date",
+            current_date,
+            date[:4] if re.match(r"^\d{4}", date) else date,
+        ),
+        ("tracknumber", current_track, track_number),
+        ("discnumber", current_disc, disc_number),
+        ("genre", current_genre, genre),
+        ("musicbrainz_trackid", current_mbid, recording_id),
+        ("musicbrainz_albumid", current_release_mbid, release_id),
     ):
-        if set_tag(audio, key, value):
-            changed.append(f"{key}={value}")
+        if missing(current) and value and set_tag(audio, key, value):
+            changes.append(f"{key}={value!r}")
+
+    group = detail.get("release-group") if detail else None
+    if isinstance(group, dict):
+        rgid = plain(group.get("id"))
+        if rgid and missing(get_tag(audio, "musicbrainz_releasegroupid")):
+            if set_tag(audio, "musicbrainz_releasegroupid", rgid):
+                changes.append(f"musicbrainz_releasegroupid={rgid!r}")
+
+    ids = artist_ids(row.get("artist-credit"))
+    if ids and missing(get_tag(audio, "musicbrainz_artistid")):
+        if set_tag(audio, "musicbrainz_artistid", ids[0]):
+            changes.append(f"musicbrainz_artistid={ids[0]!r}")
 
     isrcs = row.get("isrcs")
     if isinstance(isrcs, list) and isrcs:
         isrc = plain(isrcs[0])
-        if set_tag(audio, "isrc", isrc):
-            changed.append(f"isrc={isrc}")
+        if isrc and missing(get_tag(audio, "isrc")):
+            if set_tag(audio, "isrc", isrc):
+                changes.append(f"isrc={isrc!r}")
 
-    if not changed:
-        return False, "matched but tags not writable"
+    if not changes:
+        return False, "matched; no missing fields"
 
     try:
         audio.save()
@@ -3752,13 +5228,16 @@ def process(path: Path) -> tuple[bool, str]:
         return False, f"save error: {exc}"
 
     return True, (
-        f"score={confidence:.3f}; query={used_query!r}; "
-        f"{canonical_artist!r} — {canonical_title!r}; album={album!r}"
+        f"source={reason}; score={confidence:.3f}; "
+        f"query={source_artist!r} — {source_title!r}; "
+        f"remote={remote_artist!r} — {track_title or remote_title!r}; "
+        f"album={album!r}"
     )
 
 
 def main() -> int:
     if len(sys.argv) < 2:
+        print("usage: music-cloud-online-enrich PATH...", file=sys.stderr)
         return 2
 
     matched = 0
@@ -3768,19 +5247,22 @@ def main() -> int:
         root = Path(root_name)
         if not root.exists():
             continue
-        candidates = [root] if root.is_file() else root.rglob("*")
 
+        candidates = [root] if root.is_file() else root.rglob("*")
         for path in candidates:
             if failures >= MAX_FAILURES:
                 print(
-                    "ONLINE-WARN: MusicBrainz disabled for the rest of this "
-                    "batch after repeated failures."
+                    "ONLINE-WARN: MusicBrainz disabled for the rest of "
+                    "this batch after repeated failures."
                 )
                 print(f"ONLINE_MATCHED={matched}")
                 print(f"ONLINE_SKIPPED={skipped}")
                 return 0
 
-            if not path.is_file() or path.suffix.casefold() not in AUDIO_EXTENSIONS:
+            if (
+                not path.is_file()
+                or path.suffix.casefold() not in AUDIO_EXTENSIONS
+            ):
                 continue
 
             ok, message = process(path)
@@ -3789,7 +5271,7 @@ def main() -> int:
                 print(f"ONLINE-MATCH: {path.name}: {message}")
             else:
                 skipped += 1
-                if message not in {"not title-only"}:
+                if message not in {"metadata already complete"}:
                     print(f"ONLINE-SKIP: {path.name}: {message}")
 
     print(f"ONLINE_MATCHED={matched}")
@@ -3931,15 +5413,48 @@ def _confident_album_directory(upload: Path, parent: Path, files: list[Path]) ->
     if generic:
         return False
 
-    # Untagged album-folder fallback: require Artist/Album/file depth and track
-    # numbers on most files. A single arbitrary folder is not enough evidence.
+    # Untagged album-folder fallback. A full album is often uploaded as one
+    # directory directly under /uploads, so depth=1 must be supported. Require
+    # strong track-order evidence instead of blindly trusting the folder name.
     try:
         rel = parent.relative_to(upload)
         depth = len(rel.parts)
     except ValueError:
         depth = 0
-    numbered = sum(1 for path in files if _looks_like_numbered_track(path))
-    if depth >= 2 and numbered / len(files) >= 0.70:
+
+    track_numbers: list[int] = []
+    for path in files:
+        match = re.match(
+            r"^(?:track\s*)?(\d{1,3})[ ._-]+",
+            path.stem,
+            re.IGNORECASE,
+        )
+        if match:
+            try:
+                track_numbers.append(int(match.group(1)))
+            except ValueError:
+                pass
+
+    numbered_ratio = len(track_numbers) / len(files)
+    unique_numbers = sorted(set(track_numbers))
+    contiguous = False
+    if unique_numbers:
+        contiguous = (
+            unique_numbers[-1] - unique_numbers[0] + 1
+            <= len(unique_numbers) + 2
+        )
+
+    if depth >= 2 and numbered_ratio >= 0.60:
+        return True
+
+    # Direct /uploads/Album/... folder: require at least five tracks and a
+    # mostly contiguous numbered tracklist.
+    if (
+        depth >= 1
+        and len(files) >= 5
+        and numbered_ratio >= 0.65
+        and contiguous
+    ):
         return True
 
     return False
@@ -4223,68 +5738,45 @@ run_dedupe() {
 
 process_batch() {
     local batch="\$1"
-    local album_count single_count album_status=0 single_status=0
-    local album_fallback_status=0 single_fallback_status=0 dedupe_status=0
+    local album_count single_count
+    local album_status=0 single_status=0 dedupe_status=0
     local remaining_albums remaining_singles remaining
+
+    echo "Пакет: \${batch}"
+
+    echo "Шаг 1/3: метаданные файла -> разбор исходного имени..."
+    "\${PYTHON}" "\${METADATA_PREFLIGHT_SCRIPT}" "\${BEETS_CONFIG_DIR}/library.db" \
+        "\${batch}/albums" "\${batch}/singles" || true
+
+    echo "Шаг 2/3: заполнение отсутствующих полей из MusicBrainz..."
+    "\${PYTHON}" "\${ONLINE_ENRICH_SCRIPT}" \
+        "\${batch}/albums" "\${batch}/singles" || true
+
+    echo "Шаг 3/3: поиск общих релизов среди всей смеси файлов..."
+    "\${PYTHON}" "\${ALBUM_ENRICH_SCRIPT}" \
+        "\${batch}/albums" "\${batch}/singles" || true
 
     album_count="\$(count_audio_tree "\${batch}/albums")"
     single_count="\$(count_audio_tree "\${batch}/singles")"
 
-    echo "Пакет: \${batch}"
+    echo "После обогащения:"
     echo "  альбомных треков: \${album_count}"
     echo "  одиночных треков: \${single_count}"
 
-    echo "Предварительное восстановление метаданных из исходных имён файлов..."
-    "\${PYTHON}" "${METADATA_PREFLIGHT_SCRIPT}" "${BEETS_CONFIG_DIR}/library.db" \
-        "\${batch}/albums" "\${batch}/singles" || true
-
-    echo "Поиск полной метадаты для title-only треков через MusicBrainz..."
-    "\${PYTHON}" "${ONLINE_ENRICH_SCRIPT}" \
-        "\${batch}/albums" "\${batch}/singles" || true
-
-    # Stage 1: normal beets autotagging. This uses MusicBrainz/AcoustID and all
-    # configured metadata plugins.
+    # All automatic metadata decisions are already complete. Import as-is so
+    # beets cannot overwrite the priority order:
+    # embedded tags > filename > external metadata.
     if (( album_count > 0 )); then
         set +e
-        "\${BEET}" import -q "\${batch}/albums"
+        "\${BEET}" --plugins=musiccloud_filename import -q -A "\${batch}/albums"
         album_status=\$?
         set -e
     fi
 
     if (( single_count > 0 )); then
         set +e
-        "\${BEET}" import -q -s "\${batch}/singles"
-        single_status=\$?
-        set -e
-    fi
-
-    remaining_albums="\$(count_audio_tree "\${batch}/albums")"
-    remaining_singles="\$(count_audio_tree "\${batch}/singles")"
-
-    # Stage 2: if MusicBrainz is unavailable, a remote plugin fails, or some
-    # tracks simply cannot be matched, do not block thousands of queued files.
-    # -A disables autotagging (and therefore MusicBrainz lookup).
-    # --plugins=musiccloud_filename disables network-dependent import plugins
-    # for this fallback pass and keeps only the local filename metadata helper.
-    #
-    # Existing embedded tags are preserved. For completely untagged files the
-    # helper derives high-confidence fields from the filename/folders; when a
-    # name is ambiguous it preserves the exact source filename stem as title.
-    if (( remaining_albums > 0 )); then
-        echo "Осталось \${remaining_albums} альбомных треков после online-поиска."
-        echo "Fallback: импорт без MusicBrainz с локальными тегами/именем файла."
-        set +e
-        "\${BEET}" --plugins=musiccloud_filename import -q -A "\${batch}/albums"
-        album_fallback_status=\$?
-        set -e
-    fi
-
-    if (( remaining_singles > 0 )); then
-        echo "Осталось \${remaining_singles} одиночных треков после online-поиска."
-        echo "Fallback: импорт без MusicBrainz с локальными тегами/именем файла."
-        set +e
         "\${BEET}" --plugins=musiccloud_filename import -q -A -s "\${batch}/singles"
-        single_fallback_status=\$?
+        single_status=\$?
         set -e
     fi
 
@@ -4294,22 +5786,17 @@ process_batch() {
     remaining_singles="\$(count_audio_tree "\${batch}/singles")"
     remaining=\$(( remaining_albums + remaining_singles ))
 
-    echo "Коды beets online: albums=\${album_status}, singles=\${single_status}"
-    echo "Коды fallback: albums=\${album_fallback_status}, singles=\${single_fallback_status}; dedupe=\${dedupe_status}"
+    echo "Коды import-as-is: albums=\${album_status}, singles=\${single_status}; dedupe=\${dedupe_status}"
     echo "Осталось аудиофайлов в пакете: \${remaining}"
 
     restore_leftovers "\${batch}"
 
-    if (( remaining > 0 || album_fallback_status != 0 || single_fallback_status != 0 || dedupe_status != 0 )); then
-        echo "Пакет завершён не полностью; оставшиеся файлы возвращены в upload для повторной попытки."
+    if (( remaining > 0 || album_status != 0 || single_status != 0 || dedupe_status != 0 )); then
+        echo "Пакет завершён не полностью; оставшиеся файлы возвращены в upload."
         return 1
     fi
 
-    if (( album_status != 0 || single_status != 0 )); then
-        echo "Online-распознавание было недоступно/неполно, но fallback успешно импортировал оставшиеся файлы."
-    else
-        echo "Пакет импортирован успешно."
-    fi
+    echo "Пакет импортирован с приоритетом: tags > filename > external."
     return 0
 }
 
@@ -5704,6 +7191,7 @@ EOF
         "${IMPORT_BATCH_SCRIPT}" \
         "${METADATA_PREFLIGHT_SCRIPT}" \
         "${ONLINE_ENRICH_SCRIPT}" \
+        "${ALBUM_ENRICH_SCRIPT}" \
         "${UPLOAD_WATCH_SCRIPT}" \
         "${LEGACY_AUTO_IMPORT_WATCH_SCRIPT}" \
         "${DEDUPE_SCRIPT}" \
