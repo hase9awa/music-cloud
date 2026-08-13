@@ -47,7 +47,7 @@ set -Eeuo pipefail
 # ==============================================================================
 
 APP_NAME="music-cloud"
-SCRIPT_VERSION="5.6.1-universal"
+SCRIPT_VERSION="5.6.3-universal"
 DATA_DIR="/srv/${APP_NAME}"
 STACK_DIR="/opt/${APP_NAME}"
 STATE_DIR="/etc/${APP_NAME}"
@@ -242,7 +242,7 @@ load_install_state() {
     . "${INSTALL_STATE_FILE}"
 
     case "${STATE_VERSION:-}" in
-        3|3.*|4|4.*|5.0-home-cf|5.0.1-home-cf|5.0.2-home-cf|5.1.0-universal|5.1.1-universal|5.1.2-universal|5.2.0-universal|5.2.1-universal|5.2.2-universal|5.2.3-universal|5.3.0-universal|5.4.0-universal|5.5.0-universal|5.6.0-universal|5.6.1-universal)
+        3|3.*|4|4.*|5.0-home-cf|5.0.1-home-cf|5.0.2-home-cf|5.1.0-universal|5.1.1-universal|5.1.2-universal|5.2.0-universal|5.2.1-universal|5.2.2-universal|5.2.3-universal|5.3.0-universal|5.4.0-universal|5.5.0-universal|5.6.0-universal|5.6.1-universal|5.6.2-universal|5.6.3-universal)
             ;;
         *)
             die "Неподдерживаемая версия файла состояния ${INSTALL_STATE_FILE}."
@@ -3421,6 +3421,13 @@ from typing import Any
 
 import requests
 from mutagen import File as MutagenFile
+from mediafile import (
+    Image,
+    ImageType,
+    MediaFile,
+    UnreadableFileError,
+    image_mime_type,
+)
 
 
 AUDIO_EXTENSIONS = {
@@ -3439,6 +3446,7 @@ GENERIC_ALBUMS = {
 
 MB_BASE = "https://musicbrainz.org/ws/2"
 CAA_BASE = "https://coverartarchive.org"
+ITUNES_URL = "https://itunes.apple.com/search"
 USER_AGENT = "MusicCloud/5.5.0 (https://github.com/hase9awa/music-cloud)"
 REQUEST_INTERVAL = 1.10
 REQUEST_TIMEOUT = 15
@@ -4129,36 +4137,238 @@ def collect_genres(detail: dict[str, Any]) -> str:
     return "; ".join(result)
 
 
-def download_cover(destination: Path, release_id: str) -> bool:
-    # Keep an uploaded/local cover when it exists.
-    for name in ("cover.jpg", "cover.jpeg", "cover.png", "folder.jpg", "front.jpg"):
-        path = destination / name
-        if path.exists() and path.stat().st_size > 4096:
-            return True
+def valid_image_bytes(content: bytes) -> bool:
+    if len(content) < 1024:
+        return False
+    try:
+        mime = image_mime_type(content[:64])
+    except Exception:
+        mime = None
+    return mime in {"image/jpeg", "image/png", "image/webp"}
 
+
+def download_image(url: str) -> bytes | None:
+    if not url:
+        return None
     try:
         response = http.get(
-            f"{CAA_BASE}/release/{release_id}/front-500",
-            timeout=20,
+            url,
+            timeout=25,
             allow_redirects=True,
-            headers={"User-Agent": USER_AGENT, "Accept": "image/*"},
+            headers={
+                "User-Agent": USER_AGENT,
+                "Accept": "image/jpeg,image/png,image/webp,image/*;q=0.8",
+            },
         )
         if response.status_code == 404:
-            return False
+            return None
         response.raise_for_status()
-
-        content_type = response.headers.get("Content-Type", "").casefold()
-        if len(response.content) < 4096 or not content_type.startswith("image/"):
-            return False
-
-        suffix = ".png" if "png" in content_type else ".jpg"
-        target = destination / f"cover{suffix}"
-        temp = destination / f".cover{suffix}.tmp"
-        temp.write_bytes(response.content)
-        temp.replace(target)
-        return True
+        content = response.content
+        return content if valid_image_bytes(content) else None
     except Exception as exc:
-        print(f"ALBUM-WARN: cover art download failed: {exc}")
+        print(f"ALBUM-WARN: cover image download failed: {exc}")
+        return None
+
+
+def caa_front_url(kind: str, mbid: str) -> str:
+    if not mbid:
+        return ""
+    try:
+        response = http.get(
+            f"{CAA_BASE}/{kind}/{mbid}",
+            timeout=20,
+            headers={
+                "User-Agent": USER_AGENT,
+                "Accept": "application/json",
+            },
+        )
+        if response.status_code == 404:
+            return ""
+        response.raise_for_status()
+        data = response.json()
+    except Exception as exc:
+        print(f"ALBUM-WARN: CAA {kind} lookup failed: {exc}")
+        return ""
+
+    images = data.get("images", []) if isinstance(data, dict) else []
+    if not isinstance(images, list):
+        return ""
+
+    for item in images:
+        if not isinstance(item, dict):
+            continue
+        raw_types = item.get("types")
+        types = (
+            {plain(value).casefold() for value in raw_types}
+            if isinstance(raw_types, list)
+            else set()
+        )
+        if item.get("front") is not True and "front" not in types:
+            continue
+
+        thumbnails = item.get("thumbnails")
+        if isinstance(thumbnails, dict):
+            for key in ("500", "1200", "large", "250"):
+                url = plain(thumbnails.get(key))
+                if url:
+                    return url
+
+        url = plain(item.get("image"))
+        if url:
+            return url
+
+    return ""
+
+
+def sibling_release_ids(release_group_id: str) -> list[str]:
+    if not release_group_id:
+        return []
+
+    data = request_json(
+        f"{MB_BASE}/release-group/{release_group_id}",
+        {"inc": "releases", "fmt": "json"},
+    )
+    releases = data.get("releases", []) if data else []
+    if not isinstance(releases, list):
+        return []
+
+    valid = [
+        release for release in releases
+        if isinstance(release, dict) and plain(release.get("id"))
+    ]
+    valid.sort(
+        key=lambda release: (
+            -int(plain(release.get("status")).casefold() == "official"),
+            plain(release.get("date")) or "9999",
+        )
+    )
+
+    result: list[str] = []
+    for release in valid:
+        value = plain(release.get("id"))
+        if value not in result:
+            result.append(value)
+        if len(result) >= 8:
+            break
+    return result
+
+
+def itunes_cover_url(albumartist: str, album: str) -> str:
+    if not albumartist or not album:
+        return ""
+    try:
+        response = http.get(
+            ITUNES_URL,
+            params={
+                "term": f"{albumartist} {album}",
+                "entity": "album",
+                "media": "music",
+                "limit": 50,
+            },
+            timeout=20,
+            headers={"User-Agent": USER_AGENT},
+        )
+        response.raise_for_status()
+        data = response.json()
+    except Exception as exc:
+        print(f"ALBUM-WARN: iTunes art lookup failed: {exc}")
+        return ""
+
+    rows = data.get("results", []) if isinstance(data, dict) else []
+    scored: list[tuple[float, str]] = []
+
+    if isinstance(rows, list):
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            artist = plain(row.get("artistName"))
+            collection = plain(row.get("collectionName"))
+            url = plain(row.get("artworkUrl100"))
+            if not artist or not collection or not url:
+                continue
+            artist_score = similarity(albumartist, artist)
+            album_score = similarity(album, collection)
+            if artist_score >= 0.72 and album_score >= 0.72:
+                scored.append(
+                    (0.45 * artist_score + 0.55 * album_score, url)
+                )
+
+    if not scored:
+        return ""
+
+    scored.sort(reverse=True)
+    return scored[0][1].replace("100x100bb", "1200x1200bb")
+
+
+def resolve_cover(
+    release_id: str,
+    release_group_id: str,
+    albumartist: str,
+    album: str,
+) -> tuple[bytes | None, str]:
+    if release_id:
+        content = download_image(caa_front_url("release", release_id))
+        if content:
+            return content, "caa-release"
+
+    if release_group_id:
+        content = download_image(
+            caa_front_url("release-group", release_group_id)
+        )
+        if content:
+            return content, "caa-release-group"
+
+        for sibling_id in sibling_release_ids(release_group_id):
+            if sibling_id == release_id:
+                continue
+            content = download_image(caa_front_url("release", sibling_id))
+            if content:
+                return content, "caa-sibling-release"
+
+    content = download_image(itunes_cover_url(albumartist, album))
+    if content:
+        return content, "itunes"
+
+    return None, "not-found"
+
+
+def save_cover_file(destination: Path, content: bytes) -> Path | None:
+    try:
+        mime = image_mime_type(content[:64])
+    except Exception:
+        mime = None
+
+    suffix = ".png" if mime == "image/png" else ".jpg"
+    target = destination / f"cover{suffix}"
+    try:
+        temp = destination / f".cover{suffix}.tmp"
+        temp.write_bytes(content)
+        temp.replace(target)
+        return target
+    except Exception as exc:
+        print(f"ALBUM-WARN: cannot save sidecar cover: {exc}")
+        return None
+
+
+def embed_cover(path: Path, content: bytes) -> bool:
+    try:
+        media = MediaFile(str(path))
+        if media.images:
+            return True
+        media.images = [
+            Image(
+                data=content,
+                desc="album cover",
+                type=ImageType.front,
+            )
+        ]
+        media.save()
+        return bool(MediaFile(str(path)).images)
+    except (UnreadableFileError, OSError, ValueError) as exc:
+        print(f"ALBUM-WARN: cannot embed cover into {path.name}: {exc}")
+        return False
+    except Exception as exc:
+        print(f"ALBUM-WARN: unexpected cover embed error: {exc}")
         return False
 
 
@@ -4213,6 +4423,7 @@ def apply_cluster(
     destination.mkdir(parents=True, exist_ok=True)
 
     assigned: set[int] = set()
+    moved_paths: list[Path] = []
 
     for local, remote, score in mapped:
         audio = local["audio"]
@@ -4275,6 +4486,7 @@ def apply_cluster(
             continue
 
         local["path"] = new_path
+        moved_paths.append(new_path)
         assigned.add(local["id"])
         print(
             f"ALBUM-TRACK: {original.name} -> "
@@ -4282,10 +4494,26 @@ def apply_cluster(
             f"[{album}] pair={score:.3f}"
         )
 
-    cover_ok = download_cover(destination, release_id) if release_id else False
+    cover_content, cover_source = resolve_cover(
+        release_id,
+        release_group_id,
+        albumartist,
+        album,
+    )
+
+    embedded = 0
+    sidecar = False
+    if cover_content:
+        sidecar = save_cover_file(destination, cover_content) is not None
+        for moved_path in moved_paths:
+            if embed_cover(moved_path, cover_content):
+                embedded += 1
+
     print(
-        f"ALBUM-COVER: {'downloaded/present' if cover_ok else 'not available'} "
-        f"for {albumartist!r} — {album!r}"
+        f"ALBUM-COVER: source={cover_source}; "
+        f"sidecar={'yes' if sidecar else 'no'}; "
+        f"embedded={embedded}/{len(moved_paths)}; "
+        f"album={albumartist!r} — {album!r}"
     )
     return assigned
 
@@ -4499,6 +4727,13 @@ from typing import Any
 
 import requests
 from mutagen import File as MutagenFile
+from mediafile import (
+    Image,
+    ImageType,
+    MediaFile,
+    UnreadableFileError,
+    image_mime_type,
+)
 
 
 AUDIO_EXTENSIONS = {
@@ -4512,6 +4747,8 @@ PLACEHOLDERS = {
 }
 
 MB_BASE = "https://musicbrainz.org/ws/2"
+CAA_BASE = "https://coverartarchive.org"
+ITUNES_URL = "https://itunes.apple.com/search"
 USER_AGENT = "MusicCloud/5.6.0 (https://github.com/hase9awa/music-cloud)"
 REQUEST_INTERVAL = 1.10
 REQUEST_TIMEOUT = 15
@@ -4528,6 +4765,7 @@ last_request = 0.0
 failures = 0
 search_cache: dict[tuple[str, str], list[dict[str, Any]]] = {}
 release_cache: dict[str, dict[str, Any] | None] = {}
+cover_cache: dict[tuple[str, str], bytes | None] = {}
 
 
 def plain(value: object) -> str:
@@ -5075,6 +5313,293 @@ def collect_genres(detail: dict[str, Any] | None) -> str:
     return "; ".join(result)
 
 
+
+def existing_embedded_art(path: Path) -> bool:
+    try:
+        media = MediaFile(str(path))
+        return bool(media.images)
+    except (UnreadableFileError, OSError, ValueError):
+        return False
+    except Exception:
+        return False
+
+
+def valid_image_bytes(content: bytes) -> bool:
+    if len(content) < 1024:
+        return False
+    try:
+        mime = image_mime_type(content[:64])
+    except Exception:
+        mime = None
+    return mime in {"image/jpeg", "image/png", "image/webp"}
+
+
+def download_image(url: str) -> bytes | None:
+    if not url:
+        return None
+    try:
+        response = http.get(
+            url,
+            timeout=25,
+            allow_redirects=True,
+            headers={
+                "User-Agent": USER_AGENT,
+                "Accept": "image/jpeg,image/png,image/webp,image/*;q=0.8",
+            },
+        )
+        if response.status_code == 404:
+            return None
+        response.raise_for_status()
+        content = response.content
+        return content if valid_image_bytes(content) else None
+    except Exception as exc:
+        print(f"ART-WARN: image download failed: {exc}")
+        return None
+
+
+def caa_front_url(kind: str, mbid: str) -> str:
+    """Resolve a front image URL from the CAA JSON API, like beets fetchart."""
+    if not mbid:
+        return ""
+    try:
+        response = http.get(
+            f"{CAA_BASE}/{kind}/{mbid}",
+            timeout=20,
+            headers={
+                "User-Agent": USER_AGENT,
+                "Accept": "application/json",
+            },
+        )
+        if response.status_code == 404:
+            return ""
+        response.raise_for_status()
+        data = response.json()
+    except Exception as exc:
+        print(f"ART-WARN: CAA {kind} lookup failed: {exc}")
+        return ""
+
+    images = data.get("images", []) if isinstance(data, dict) else []
+    if not isinstance(images, list):
+        return ""
+
+    front: list[dict[str, Any]] = []
+    rest: list[dict[str, Any]] = []
+
+    for item in images:
+        if not isinstance(item, dict):
+            continue
+        raw_types = item.get("types")
+        types = (
+            {plain(value).casefold() for value in raw_types}
+            if isinstance(raw_types, list)
+            else set()
+        )
+        if item.get("front") is True or "front" in types:
+            front.append(item)
+        else:
+            rest.append(item)
+
+    # We only want actual front art. Falling back to a back/disc scan would be
+    # worse than leaving the default Navidrome image.
+    for item in front:
+        thumbnails = item.get("thumbnails")
+        if isinstance(thumbnails, dict):
+            for key in ("500", "1200", "large", "250"):
+                url = plain(thumbnails.get(key))
+                if url:
+                    return url
+        url = plain(item.get("image"))
+        if url:
+            return url
+
+    return ""
+
+
+def sibling_release_ids(release_group_id: str) -> list[str]:
+    if not release_group_id:
+        return []
+
+    data = request_json(
+        f"{MB_BASE}/release-group/{release_group_id}",
+        {
+            "inc": "releases",
+            "fmt": "json",
+        },
+    )
+    releases = data.get("releases", []) if data else []
+    if not isinstance(releases, list):
+        return []
+
+    def key(release: dict[str, Any]) -> tuple[int, str]:
+        status = plain(release.get("status")).casefold()
+        return (-int(status == "official"), plain(release.get("date")) or "9999")
+
+    valid = [
+        release for release in releases
+        if isinstance(release, dict) and plain(release.get("id"))
+    ]
+    valid.sort(key=key)
+
+    result: list[str] = []
+    for release in valid:
+        release_id = plain(release.get("id"))
+        if release_id not in result:
+            result.append(release_id)
+        if len(result) >= 8:
+            break
+    return result
+
+
+def itunes_cover_url(albumartist: str, album: str) -> str:
+    if not albumartist or not album:
+        return ""
+
+    try:
+        response = http.get(
+            ITUNES_URL,
+            params={
+                "term": f"{albumartist} {album}",
+                "entity": "album",
+                "media": "music",
+                "limit": 50,
+            },
+            timeout=20,
+            headers={"User-Agent": USER_AGENT},
+        )
+        response.raise_for_status()
+        data = response.json()
+    except Exception as exc:
+        print(f"ART-WARN: iTunes lookup failed: {exc}")
+        return ""
+
+    rows = data.get("results", []) if isinstance(data, dict) else []
+    if not isinstance(rows, list):
+        return ""
+
+    scored: list[tuple[float, str]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        artist = plain(row.get("artistName"))
+        collection = plain(row.get("collectionName"))
+        url = plain(row.get("artworkUrl100"))
+        if not artist or not collection or not url:
+            continue
+
+        artist_score = similarity(albumartist, artist)
+        album_score = similarity(album, collection)
+        score = 0.45 * artist_score + 0.55 * album_score
+
+        if artist_score >= 0.72 and album_score >= 0.72:
+            scored.append((score, url))
+
+    if not scored:
+        return ""
+
+    scored.sort(reverse=True)
+    url = scored[0][1]
+    return url.replace("100x100bb", "1200x1200bb")
+
+
+def cover_bytes(
+    release_id: str,
+    release_group_id: str,
+    albumartist: str,
+    album: str,
+) -> tuple[bytes | None, str]:
+    key = (release_id, release_group_id)
+    if key in cover_cache:
+        cached = cover_cache[key]
+        return cached, "cache" if cached else "not-found"
+
+    # 1. Exact MusicBrainz release.
+    if release_id:
+        url = caa_front_url("release", release_id)
+        content = download_image(url)
+        if content:
+            cover_cache[key] = content
+            return content, "caa-release"
+
+    # 2. Canonical front for the MusicBrainz release group.
+    if release_group_id:
+        url = caa_front_url("release-group", release_group_id)
+        content = download_image(url)
+        if content:
+            cover_cache[key] = content
+            return content, "caa-release-group"
+
+    # 3. Another official edition of the same album. This is important when the
+    # recording search selects an edition with no uploaded cover while another
+    # edition of the exact same release group has front art.
+    if release_group_id:
+        for sibling_id in sibling_release_ids(release_group_id):
+            if sibling_id == release_id:
+                continue
+            url = caa_front_url("release", sibling_id)
+            content = download_image(url)
+            if content:
+                cover_cache[key] = content
+                return content, "caa-sibling-release"
+
+    # 4. Restore the fallback that the original installer got from beets'
+    # fetchart plugin: iTunes album artwork by albumartist + album.
+    url = itunes_cover_url(albumartist, album)
+    content = download_image(url)
+    if content:
+        cover_cache[key] = content
+        return content, "itunes"
+
+    cover_cache[key] = None
+    return None, "not-found"
+
+
+def embed_cover_if_missing(
+    path: Path,
+    release_id: str,
+    release_group_id: str,
+    albumartist: str,
+    album: str,
+) -> str:
+    if existing_embedded_art(path):
+        return "existing"
+
+    content, source = cover_bytes(
+        release_id,
+        release_group_id,
+        albumartist,
+        album,
+    )
+    if not content:
+        return source
+
+    try:
+        media = MediaFile(str(path))
+        if media.images:
+            return "existing"
+
+        media.images = [
+            Image(
+                data=content,
+                desc="album cover",
+                type=ImageType.front,
+            )
+        ]
+        media.save()
+
+        # Verify the write rather than assuming MediaFile accepted it.
+        verify = MediaFile(str(path))
+        if verify.images:
+            return f"embedded:{source}"
+
+        return "embed-verify-failed"
+    except (UnreadableFileError, OSError, ValueError) as exc:
+        print(f"ART-WARN: cannot embed cover into {path.name}: {exc}")
+        return "embed-error"
+    except Exception as exc:
+        print(f"ART-WARN: unexpected embed error for {path.name}: {exc}")
+        return "embed-error"
+
+
 def process(path: Path) -> tuple[bool, str]:
     try:
         audio = MutagenFile(path, easy=True)
@@ -5096,7 +5621,12 @@ def process(path: Path) -> tuple[bool, str]:
     current_mbid = get_tag(audio, "musicbrainz_trackid")
     current_release_mbid = get_tag(audio, "musicbrainz_albumid")
 
-    # Nothing to enrich.
+    current_release_group_mbid = get_tag(
+        audio, "musicbrainz_releasegroupid"
+    )
+
+    # Textual metadata can already be complete while artwork is still missing.
+    # Artwork is therefore repaired independently from the metadata gap-filler.
     if (
         not missing(current_artist)
         and not missing(current_title)
@@ -5105,7 +5635,27 @@ def process(path: Path) -> tuple[bool, str]:
         and current_mbid
         and current_release_mbid
     ):
-        return False, "metadata already complete"
+        release_group_id = current_release_group_mbid
+        if not release_group_id:
+            existing_detail = release_detail(current_release_mbid)
+            if (
+                existing_detail
+                and isinstance(existing_detail.get("release-group"), dict)
+            ):
+                release_group_id = plain(
+                    existing_detail["release-group"].get("id")
+                )
+
+        art_status = embed_cover_if_missing(
+            path,
+            current_release_mbid,
+            release_group_id,
+            current_albumartist or current_artist,
+            current_album,
+        )
+        if art_status.startswith("embedded:"):
+            return True, f"metadata already complete; art={art_status}"
+        return False, f"metadata already complete; art={art_status}"
 
     try:
         duration = float(audio.info.length)
@@ -5129,6 +5679,12 @@ def process(path: Path) -> tuple[bool, str]:
     release = choose_release(row)
     release_id = plain(release.get("id")) if release else ""
     detail = release_detail(release_id) if release_id else None
+
+    release_group_id = ""
+    if detail and isinstance(detail.get("release-group"), dict):
+        release_group_id = plain(detail["release-group"].get("id"))
+    elif release and isinstance(release.get("release-group"), dict):
+        release_group_id = plain(release["release-group"].get("id"))
 
     album = ""
     albumartist = ""
@@ -5200,12 +5756,18 @@ def process(path: Path) -> tuple[bool, str]:
         if missing(current) and value and set_tag(audio, key, value):
             changes.append(f"{key}={value!r}")
 
-    group = detail.get("release-group") if detail else None
-    if isinstance(group, dict):
-        rgid = plain(group.get("id"))
-        if rgid and missing(get_tag(audio, "musicbrainz_releasegroupid")):
-            if set_tag(audio, "musicbrainz_releasegroupid", rgid):
-                changes.append(f"musicbrainz_releasegroupid={rgid!r}")
+    if (
+        release_group_id
+        and missing(get_tag(audio, "musicbrainz_releasegroupid"))
+    ):
+        if set_tag(
+            audio,
+            "musicbrainz_releasegroupid",
+            release_group_id,
+        ):
+            changes.append(
+                f"musicbrainz_releasegroupid={release_group_id!r}"
+            )
 
     ids = artist_ids(row.get("artist-credit"))
     if ids and missing(get_tag(audio, "musicbrainz_artistid")):
@@ -5219,19 +5781,28 @@ def process(path: Path) -> tuple[bool, str]:
             if set_tag(audio, "isrc", isrc):
                 changes.append(f"isrc={isrc!r}")
 
-    if not changes:
-        return False, "matched; no missing fields"
+    if changes:
+        try:
+            audio.save()
+        except Exception as exc:
+            return False, f"save error: {exc}"
 
-    try:
-        audio.save()
-    except Exception as exc:
-        return False, f"save error: {exc}"
+    art_status = embed_cover_if_missing(
+        path,
+        release_id,
+        release_group_id,
+        albumartist or source_artist or remote_artist,
+        album,
+    )
+
+    if not changes and not art_status.startswith("embedded:"):
+        return False, f"matched; no missing fields; art={art_status}"
 
     return True, (
         f"source={reason}; score={confidence:.3f}; "
         f"query={source_artist!r} — {source_title!r}; "
         f"remote={remote_artist!r} — {track_title or remote_title!r}; "
-        f"album={album!r}"
+        f"album={album!r}; art={art_status}"
     )
 
 
@@ -5889,6 +6460,7 @@ fi
         echo "Проверка отсутствующих обложек альбомов..."
         "\${BEET}" fetchart -q || echo "fetchart: часть обложек не удалось получить"
         "\${BEET}" embedart || echo "embedart: часть обложек не удалось встроить"
+        echo "Для singleton-треков обложка встраивается напрямую до импорта."
     fi
 
     if (( batches >= MAX_BATCHES_PER_RUN && pending > 0 )); then
