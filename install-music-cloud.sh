@@ -47,7 +47,7 @@ set -Eeuo pipefail
 # ==============================================================================
 
 APP_NAME="music-cloud"
-SCRIPT_VERSION="5.1.2-universal"
+SCRIPT_VERSION="5.2.0-universal"
 DATA_DIR="/srv/${APP_NAME}"
 STACK_DIR="/opt/${APP_NAME}"
 STATE_DIR="/etc/${APP_NAME}"
@@ -72,6 +72,9 @@ CLOUDFLARED_TOKEN_FILE="${SECRETS_DIR}/cloudflare-tunnel-token"
 BEETS_VENV="${STACK_DIR}/beets-venv"
 BEETS_CONFIG_DIR="${STATE_DIR}/beets"
 BEETS_CONFIG_FILE="${BEETS_CONFIG_DIR}/config.yaml"
+BEETS_PLUGIN_DIR="${BEETS_CONFIG_DIR}/plugins"
+BEETS_FILENAME_PLUGIN="${BEETS_PLUGIN_DIR}/musiccloud_filename.py"
+IMPORT_QUEUE_DIR="${DATA_DIR}/import-queue"
 
 CADDY_SITE_DIR="/etc/caddy/sites.d"
 CADDY_SITE_FILE="${CADDY_SITE_DIR}/${APP_NAME}.caddy"
@@ -81,6 +84,7 @@ CLOUDFLARED_METRICS_PORT="20241"
 CREDENTIALS_FILE="/root/${APP_NAME}-credentials.txt"
 
 AUTO_IMPORT_SCRIPT="/usr/local/bin/${APP_NAME}-auto-import"
+IMPORT_BATCH_SCRIPT="/usr/local/bin/${APP_NAME}-stage-import-batch"
 DEDUPE_SCRIPT="/usr/local/bin/${APP_NAME}-dedupe"
 BEETS_WRAPPER="/usr/local/bin/${APP_NAME}-beet"
 BEETS_UPDATE_SCRIPT="/usr/local/bin/${APP_NAME}-beets-update"
@@ -235,7 +239,7 @@ load_install_state() {
     . "${INSTALL_STATE_FILE}"
 
     case "${STATE_VERSION:-}" in
-        3|3.*|4|4.*|5.0-home-cf|5.0.1-home-cf|5.0.2-home-cf|5.1.0-universal|5.1.1-universal|5.1.2-universal)
+        3|3.*|4|4.*|5.0-home-cf|5.0.1-home-cf|5.0.2-home-cf|5.1.0-universal|5.1.1-universal|5.1.2-universal|5.2.0-universal)
             ;;
         *)
             die "Неподдерживаемая версия файла состояния ${INSTALL_STATE_FILE}."
@@ -1175,6 +1179,7 @@ create_directories() {
     install -d -m 0755 \
         "${DATA_DIR}" \
         "${UPLOAD_DIR}" \
+        "${IMPORT_QUEUE_DIR}" \
         "${STACK_DIR}" \
         "${STACK_DIR}/navidrome-data" \
         "${STACK_DIR}/copyparty-data" \
@@ -1186,11 +1191,12 @@ create_directories() {
 
     chown -R "${RUN_UID}:${RUN_GID}" \
         "${UPLOAD_DIR}" \
+        "${IMPORT_QUEUE_DIR}" \
         "${STACK_DIR}/navidrome-data" \
         "${STACK_DIR}/copyparty-data" \
         "${STACK_DIR}/tagr-data"
 
-    chmod 0755 "${UPLOAD_DIR}"
+    chmod 0755 "${UPLOAD_DIR}" "${IMPORT_QUEUE_DIR}"
     prepare_library_directory
     configure_storage_boot_dependency
 }
@@ -1317,13 +1323,285 @@ ui_path.write_text(text, encoding="utf-8")
 print(f"beets Python 3.14 terminal-width patch applied: {ui_path}")
 PYBEETSTERM
 
+
+    install -d -m 0700 -o "${RUN_USER}" -g "${RUN_GROUP}" "${BEETS_PLUGIN_DIR}"
+
+    cat > "${BEETS_FILENAME_PLUGIN}" <<'PYMUSICCLOUDFILENAME'
+from __future__ import annotations
+
+import os
+import re
+import unicodedata
+from pathlib import Path
+
+from beets import plugins
+from beets.util import displayable_path
+
+
+_PLACEHOLDERS = {
+    "",
+    "unknown",
+    "unknown artist",
+    "unknown title",
+    "unknown track",
+    "untitled",
+    "none",
+    "n/a",
+    "na",
+    "<unknown>",
+    "(unknown)",
+}
+
+
+def _plain(value: object) -> str:
+    return str(value or "").strip()
+
+
+def _fold(value: object) -> str:
+    text = unicodedata.normalize("NFKC", _plain(value)).casefold()
+    text = re.sub(r"[_\s]+", " ", text)
+    return text.strip(" ._-–—()[]{}")
+
+
+def _missing(value: object) -> bool:
+    return _fold(value) in _PLACEHOLDERS
+
+
+def _humanize(value: str) -> str:
+    value = unicodedata.normalize("NFKC", value)
+    value = re.sub(r"[_\s]+", " ", value)
+    return value.strip(" ._-–—")
+
+
+def _strip_track_prefix(value: str) -> str:
+    return re.sub(
+        r"^(?:(?:track|trk)\s*)?\d{1,4}(?:[._ -]+)",
+        "",
+        value,
+        flags=re.IGNORECASE,
+    ).strip()
+
+
+def _script_kind(token: str) -> str:
+    latin = 0
+    cyrillic = 0
+    for char in token:
+        if not char.isalpha():
+            continue
+        try:
+            name = unicodedata.name(char)
+        except ValueError:
+            continue
+        if "CYRILLIC" in name:
+            cyrillic += 1
+        elif "LATIN" in name:
+            latin += 1
+    if latin and not cyrillic:
+        return "latin"
+    if cyrillic and not latin:
+        return "cyrillic"
+    return ""
+
+
+def _split_script_transition(stem: str) -> tuple[str, str] | None:
+    # Useful for names such as:
+    # HAPPY_KITTY_DRUGS_Подхалигалипаратруппермство.mp3
+    tokens = [t for t in re.split(r"[_\s]+", stem) if t]
+    if len(tokens) < 2:
+        return None
+
+    kinds = [_script_kind(t) for t in tokens]
+    for index in range(1, len(tokens)):
+        left_kind = next((k for k in reversed(kinds[:index]) if k), "")
+        right_kind = next((k for k in kinds[index:] if k), "")
+        if left_kind and right_kind and left_kind != right_kind:
+            left = _humanize(" ".join(tokens[:index]))
+            right = _humanize(" ".join(tokens[index:]))
+            if len(left) >= 2 and len(right) >= 2:
+                return left, right
+    return None
+
+
+def _parse_filename(stem: str) -> tuple[str, str]:
+    raw = _strip_track_prefix(stem)
+    human = _humanize(raw)
+
+    # Strong, explicit separators first.
+    patterns = (
+        r"^(.+?)\s+(?:-|–|—)\s+(.+)$",
+        r"^(.+?)\s+by\s+(.+)$",
+    )
+    for pattern in patterns:
+        match = re.match(pattern, human, flags=re.IGNORECASE)
+        if not match:
+            continue
+        left = _humanize(match.group(1))
+        right = _humanize(match.group(2))
+        if not left or not right:
+            continue
+        if " by " in human.casefold():
+            # "Title by Artist"
+            return right, left
+        return left, right
+
+    # Double underscores are often deliberately used as an artist/title separator.
+    match = re.match(r"^(.+?)__+(.+)$", raw)
+    if match:
+        left = _humanize(match.group(1))
+        right = _humanize(match.group(2))
+        if left and right:
+            return left, right
+
+    script_split = _split_script_transition(raw)
+    if script_split:
+        return script_split
+
+    return "", ""
+
+
+def _looks_filename_derived(value: object, stem: str) -> bool:
+    current = _fold(value)
+    if not current:
+        return True
+    candidates = {
+        _fold(stem),
+        _fold(_humanize(stem)),
+        _fold(_strip_track_prefix(stem)),
+        _fold(_humanize(_strip_track_prefix(stem))),
+    }
+    return current in candidates
+
+
+def _directory_hints(
+    path: str, upload_root: str, queue_root: str
+) -> tuple[str, str]:
+    """Return conservative (artist, album) hints from the original layout."""
+    resolved = Path(path).resolve()
+    dirs: list[str] = []
+
+    try:
+        rel = resolved.relative_to(Path(upload_root).resolve())
+        dirs = list(rel.parts[:-1])
+    except (ValueError, OSError):
+        # During batched import files live under:
+        # QUEUE/batch-.../(albums|singles)/<original relative path>.
+        try:
+            rel = resolved.relative_to(Path(queue_root).resolve())
+            parts = list(rel.parts)
+            if (
+                len(parts) >= 3
+                and parts[0].startswith("batch-")
+                and parts[1] in {"albums", "singles"}
+            ):
+                dirs = parts[2:-1]
+        except (ValueError, OSError):
+            dirs = []
+
+    if not dirs:
+        return "", ""
+
+    ignored = {
+        "upload",
+        "uploads",
+        "music",
+        "incoming",
+        "download",
+        "downloads",
+        "unknown",
+        "unknown artist",
+    }
+
+    if len(dirs) >= 2:
+        artist = _humanize(dirs[-2])
+        album = _humanize(dirs[-1])
+        if _fold(artist) in ignored:
+            artist = ""
+        if _fold(album) in ignored:
+            album = ""
+        return artist, album
+
+    parent = _humanize(dirs[-1])
+    if _fold(parent) in ignored:
+        return "", ""
+    # With only one directory level it is ambiguous whether this is artist or
+    # album. Use it only as a weak artist hint; never invent an album here.
+    return parent, ""
+
+
+class MusicCloudFilenamePlugin(plugins.BeetsPlugin):
+    def __init__(self) -> None:
+        super().__init__()
+        self.config.add({"upload_root": "", "queue_root": ""})
+        self.register_listener("import_task_start", self.filename_task)
+
+    def filename_task(self, task, session) -> None:
+        items = task.items if task.is_album else [task.item]
+        upload_root = self.config["upload_root"].as_str()
+        queue_root = self.config["queue_root"].as_str()
+
+        for item in items:
+            path = displayable_path(item.path)
+            stem, _ = os.path.splitext(os.path.basename(path))
+            guessed_artist, guessed_title = _parse_filename(stem)
+            dir_artist, dir_album = _directory_hints(
+                path, upload_root, queue_root
+            )
+
+            artist_missing = _missing(item.artist)
+            title_missing = _missing(item.title)
+            album_missing = _missing(item.album)
+            albumartist_missing = _missing(item.albumartist)
+
+            # Prefer an explicit filename split. This data is available before
+            # autotagging, so MusicBrainz receives a useful artist/title query.
+            if guessed_artist and artist_missing:
+                item.artist = guessed_artist
+                artist_missing = False
+                self._log.info("Artist inferred from filename: {.artist}", item)
+
+            if guessed_title and (
+                title_missing or _looks_filename_derived(item.title, stem)
+            ):
+                item.title = guessed_title
+                title_missing = False
+                self._log.info("Title inferred from filename: {.title}", item)
+
+            # Folder layout is a secondary hint for common Artist/Album/file
+            # libraries uploaded as a directory tree.
+            if artist_missing and dir_artist:
+                item.artist = dir_artist
+                artist_missing = False
+                self._log.info("Artist inferred from directory: {.artist}", item)
+
+            if album_missing and dir_album:
+                item.album = dir_album
+                album_missing = False
+                self._log.info("Album inferred from directory: {.album}", item)
+
+            if albumartist_missing and not _missing(item.artist):
+                item.albumartist = item.artist
+
+            # Absolute fallback: never let an untagged, unrecognized file become
+            # a blank-titled track. If no reliable split was found, preserve the
+            # original filename stem exactly as the title.
+            if title_missing:
+                item.title = stem
+                self._log.info("Title preserved from source filename: {.title}", item)
+PYMUSICCLOUDFILENAME
+
+    chown "${RUN_UID}:${RUN_GID}" "${BEETS_FILENAME_PLUGIN}"
+    chmod 0600 "${BEETS_FILENAME_PLUGIN}"
+    run_as_owner "${BEETS_VENV}/bin/python" -m py_compile "${BEETS_FILENAME_PLUGIN}"
+
     cat > "${BEETS_CONFIG_FILE}" <<EOF
 directory: ${LIBRARY_DIR}
 library: ${BEETS_CONFIG_DIR}/library.db
+pluginpath: ${BEETS_PLUGIN_DIR}
 
 plugins:
   - musicbrainz
   - chroma
+  - musiccloud_filename
   - fromfilename
   - fetchart
   - embedart
@@ -1354,6 +1632,10 @@ paths:
   default: \$albumartist/\$album%aunique{}/\$disc-\$track \$title
   singleton: Singles/\$artist/\$title
   comp: Compilations/\$album%aunique{}/\$disc-\$track \$title
+
+musiccloud_filename:
+  upload_root: ${UPLOAD_DIR}
+  queue_root: ${IMPORT_QUEUE_DIR}
 
 fromfilename:
   auto: true
@@ -2316,17 +2598,264 @@ PYDEDUPE
     chmod 0755 "${DEDUPE_SCRIPT}"
     "${BEETS_VENV}/bin/python" -m py_compile "${DEDUPE_SCRIPT}"
 
+    cat > "${IMPORT_BATCH_SCRIPT}" <<'PYMUSICCLOUDBATCH'
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import os
+import shutil
+import sys
+import time
+import uuid
+from collections import defaultdict
+from pathlib import Path
+
+
+AUDIO_EXTENSIONS = {
+    ".mp3", ".flac", ".m4a", ".mp4", ".ogg", ".opus", ".wav", ".wave",
+    ".aif", ".aiff", ".alac", ".wma", ".ape", ".mpc", ".tta", ".dsf", ".dff",
+}
+ART_NAMES = {
+    "cover.jpg", "cover.jpeg", "cover.png", "cover.webp",
+    "folder.jpg", "folder.jpeg", "folder.png", "folder.webp",
+    "front.jpg", "front.jpeg", "front.png", "front.webp",
+}
+MAX_ALBUM_GROUP = 120
+RECHECK_SECONDS = 3
+
+
+def is_audio(path: Path) -> bool:
+    return path.is_file() and path.suffix.casefold() in AUDIO_EXTENSIONS
+
+
+def stat_signature(path: Path) -> tuple[int, int] | None:
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    return st.st_size, st.st_mtime_ns
+
+
+def stable_audio(upload: Path, stable_seconds: int) -> list[Path]:
+    now = time.time()
+    cutoff = now - stable_seconds
+    initial: dict[Path, tuple[int, int]] = {}
+
+    for path in upload.rglob("*"):
+        if not is_audio(path):
+            continue
+        try:
+            st = path.stat()
+        except OSError:
+            continue
+        if st.st_mtime <= cutoff:
+            initial[path] = (st.st_size, st.st_mtime_ns)
+
+    if not initial:
+        return []
+
+    # mtime alone can be misleading on unusual clients/filesystems. Recheck both
+    # size and mtime so we never move a file while Copyparty is still writing it.
+    time.sleep(RECHECK_SECONDS)
+
+    result: list[Path] = []
+    for path, signature in initial.items():
+        if stat_signature(path) == signature:
+            result.append(path)
+    return result
+
+
+def choose_files(
+    upload: Path,
+    stable: list[Path],
+    limit: int,
+    stable_seconds: int,
+) -> tuple[list[Path], list[Path], set[Path]]:
+    stable_set = set(stable)
+    groups: dict[Path, list[Path]] = defaultdict(list)
+
+    all_audio: list[Path] = []
+    for path in upload.rglob("*"):
+        if is_audio(path):
+            all_audio.append(path)
+            groups[path.parent].append(path)
+
+    selected_albums: list[Path] = []
+    selected_singles: list[Path] = []
+    selected_album_dirs: set[Path] = set()
+    remaining = limit
+    cutoff = time.time() - stable_seconds
+
+    # Completed leaf directories of sensible album size are preserved as album
+    # groups. This prevents a 20-track album from being split across batches.
+    album_candidates: list[tuple[float, Path, list[Path]]] = []
+    for parent, files in groups.items():
+        if parent == upload:
+            continue
+        if len(files) > MAX_ALBUM_GROUP:
+            continue
+        if not all(path in stable_set for path in files):
+            continue
+        try:
+            # If new files were recently created in the directory, wait before
+            # treating the directory as complete.
+            if parent.stat().st_mtime > cutoff:
+                continue
+            oldest = min(path.stat().st_mtime for path in files)
+        except OSError:
+            continue
+        album_candidates.append((oldest, parent, sorted(files)))
+
+    album_candidates.sort(key=lambda row: row[0])
+
+    for _, parent, files in album_candidates:
+        if not files:
+            continue
+        if len(files) > remaining and selected_albums:
+            continue
+        # A single normal-sized album may exceed the remaining capacity; keep
+        # it intact rather than splitting it.
+        selected_albums.extend(files)
+        selected_album_dirs.add(parent)
+        remaining = max(0, limit - len(selected_albums) - len(selected_singles))
+        if remaining == 0:
+            break
+
+    if remaining > 0:
+        # Root-level files and abnormally huge directories are handled as
+        # singletons. This is critical for flat uploads containing thousands of
+        # unrelated tracks: beets must not see them as one enormous album.
+        singles: list[Path] = []
+        for path in stable:
+            if path in selected_albums:
+                continue
+            if path.parent == upload:
+                singles.append(path)
+                continue
+            parent_group = groups.get(path.parent, [])
+            if len(parent_group) > MAX_ALBUM_GROUP:
+                singles.append(path)
+
+        singles.sort(key=lambda p: p.stat().st_mtime if p.exists() else 0)
+        selected_singles.extend(singles[:remaining])
+
+    return selected_albums, selected_singles, selected_album_dirs
+
+
+def move_one(src: Path, dst: Path) -> None:
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    os.replace(src, dst)
+
+
+def main() -> int:
+    if len(sys.argv) != 5:
+        print(
+            "usage: stage-import-batch UPLOAD QUEUE BATCH_SIZE STABLE_SECONDS",
+            file=sys.stderr,
+        )
+        return 2
+
+    upload = Path(sys.argv[1]).resolve()
+    queue = Path(sys.argv[2]).resolve()
+    batch_size = max(1, int(sys.argv[3]))
+    stable_seconds = max(10, int(sys.argv[4]))
+
+    upload.mkdir(parents=True, exist_ok=True)
+    queue.mkdir(parents=True, exist_ok=True)
+
+    stable = stable_audio(upload, stable_seconds)
+    if not stable:
+        print("BATCH_PATH=")
+        print("BATCH_AUDIO=0")
+        return 0
+
+    albums, singles, album_dirs = choose_files(
+        upload, stable, batch_size, stable_seconds
+    )
+    chosen = albums + singles
+    if not chosen:
+        print("BATCH_PATH=")
+        print("BATCH_AUDIO=0")
+        return 0
+
+    batch = queue / (
+        f"batch-{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+    )
+    album_root = batch / "albums"
+    singles_root = batch / "singles"
+
+    try:
+        for src in albums:
+            rel = src.relative_to(upload)
+            move_one(src, album_root / rel)
+
+        for src in singles:
+            rel = src.relative_to(upload)
+            move_one(src, singles_root / rel)
+
+        # Keep local cover art with a completed album directory when possible.
+        for parent in album_dirs:
+            rel_parent = parent.relative_to(upload)
+            for child in parent.iterdir():
+                if not child.is_file() or child.name.casefold() not in ART_NAMES:
+                    continue
+                try:
+                    if child.stat().st_mtime > time.time() - stable_seconds:
+                        continue
+                except OSError:
+                    continue
+                move_one(child, album_root / rel_parent / child.name)
+    except Exception:
+        # Best-effort rollback. The auto-import script also knows how to recover
+        # abandoned batches after service restarts.
+        for mode_root in (album_root, singles_root):
+            if not mode_root.exists():
+                continue
+            for path in sorted(mode_root.rglob("*"), reverse=True):
+                if not path.is_file():
+                    continue
+                rel = path.relative_to(mode_root)
+                target = upload / rel
+                target.parent.mkdir(parents=True, exist_ok=True)
+                if not target.exists():
+                    os.replace(path, target)
+        shutil.rmtree(batch, ignore_errors=True)
+        raise
+
+    print(f"BATCH_PATH={batch}")
+    print(f"BATCH_AUDIO={len(chosen)}")
+    print(f"BATCH_ALBUM_AUDIO={len(albums)}")
+    print(f"BATCH_SINGLE_AUDIO={len(singles)}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+PYMUSICCLOUDBATCH
+
+    chmod 0755 "${IMPORT_BATCH_SCRIPT}"
+    "${BEETS_VENV}/bin/python" -m py_compile "${IMPORT_BATCH_SCRIPT}"
+
     cat > "${AUTO_IMPORT_SCRIPT}" <<EOF
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
 UPLOAD="${UPLOAD_DIR}"
+QUEUE="${IMPORT_QUEUE_DIR}"
 BEET="${BEETS_WRAPPER}"
 DEDUPE="${DEDUPE_SCRIPT}"
+BATCHER="${IMPORT_BATCH_SCRIPT}"
+PYTHON="${BEETS_VENV}/bin/python"
 LOG="${BEETS_CONFIG_DIR}/auto-import.log"
 LOCK="/run/lock/${APP_NAME}-beets.lock"
-QUIET_SECONDS=45
-MAX_NO_PROGRESS=2
+
+# A batch is deliberately small enough for low-cost VPS instances, while a
+# long-running service can drain many batches sequentially.
+BATCH_SIZE=200
+STABLE_SECONDS=60
+SCAN_INTERVAL=10
+IDLE_EXIT_SECONDS=120
+MAX_BATCHES_PER_RUN=100
 
 find_audio() {
     find "\${UPLOAD}" -type f \
@@ -2338,60 +2867,73 @@ find_audio() {
            -iname '*.dsf' -o -iname '*.dff' \) "\$@"
 }
 
-has_audio() {
-    find_audio -print -quit | grep -q .
+count_audio_tree() {
+    local root="\$1"
+    find "\${root}" -type f \
+        \( -iname '*.mp3' -o -iname '*.flac' -o -iname '*.m4a' -o \
+           -iname '*.mp4' -o -iname '*.ogg' -o -iname '*.opus' -o \
+           -iname '*.wav' -o -iname '*.wave' -o -iname '*.aif' -o \
+           -iname '*.aiff' -o -iname '*.alac' -o -iname '*.wma' -o \
+           -iname '*.ape' -o -iname '*.mpc' -o -iname '*.tta' -o \
+           -iname '*.dsf' -o -iname '*.dff' \) -printf 'x\n' 2>/dev/null | wc -l
 }
 
-count_audio() {
+count_upload_audio() {
     find_audio -printf 'x\n' | wc -l
 }
 
-upload_has_content() {
-    find "\${UPLOAD}" -mindepth 1 \
-        ! -name '.music-cloud-keep' -print -quit | grep -q .
+existing_batch() {
+    find "\${QUEUE}" -mindepth 1 -maxdepth 1 -type d -name 'batch-*' \
+        -print 2>/dev/null | LC_ALL=C sort | head -n 1
 }
 
-wait_for_first_audio() {
-    local attempt
+restore_leftovers() {
+    local batch="\$1"
 
-    # Copyparty сначала может создать каталог, а файл записать уже внутри него.
-    # PathChanged на корне не рекурсивен, поэтому не выходим мгновенно из
-    # сервиса в узком окне между созданием каталога и появлением аудиофайла.
-    for attempt in {1..15}; do
-        has_audio && return 0
-        upload_has_content || return 1
-        sleep 2
-    done
+    "\${PYTHON}" - "\${batch}" "\${UPLOAD}" <<'PYRESTORE'
+from __future__ import annotations
 
-    has_audio
+import os
+import shutil
+import sys
+import time
+from pathlib import Path
+
+batch = Path(sys.argv[1])
+upload = Path(sys.argv[2])
+audio_ext = {
+    ".mp3", ".flac", ".m4a", ".mp4", ".ogg", ".opus", ".wav", ".wave",
+    ".aif", ".aiff", ".alac", ".wma", ".ape", ".mpc", ".tta", ".dsf", ".dff",
 }
 
-wait_for_upload_quiet() {
-    local rc
+restored = 0
+for mode in ("albums", "singles"):
+    root = batch / mode
+    if not root.exists():
+        continue
+    for path in sorted(root.rglob("*")):
+        if not path.is_file():
+            continue
+        rel = path.relative_to(root)
+        target = upload / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
 
-    echo "Ожидание \${QUIET_SECONDS} секунд без изменений в каталоге загрузки..."
+        if target.exists():
+            stamp = time.strftime("%Y%m%d-%H%M%S")
+            target = target.with_name(
+                f"{target.stem}.music-cloud-retry-{stamp}-{os.getpid()}{target.suffix}"
+            )
 
-    while true; do
-        set +e
-        /usr/bin/inotifywait -q -r -t "\${QUIET_SECONDS}" \
-            -e close_write,moved_to,moved_from,create,delete,modify,attrib \
-            -- "\${UPLOAD}" >/dev/null 2>>"\${LOG}"
-        rc=\$?
-        set -e
+        os.replace(path, target)
+        # Failed leftovers should not be picked up again immediately in the same
+        # service run. The timer/watchers will retry them later.
+        if target.suffix.casefold() in audio_ext:
+            os.utime(target, None)
+        restored += 1
 
-        case "\${rc}" in
-            0) continue ;;
-            2) return 0 ;;
-            *)
-                # Ошибка inotify (например, исчерпан лимит watches) не должна
-                # навсегда блокировать импорт уже загруженных файлов. Даём
-                # записи завершиться и продолжаем по таймерному fallback.
-                echo "inotifywait завершился с кодом \${rc}; fallback: ожидание \${QUIET_SECONDS} секунд без inotify."
-                sleep "\${QUIET_SECONDS}"
-                return 0
-                ;;
-        esac
-    done
+shutil.rmtree(batch, ignore_errors=True)
+print(f"RESTORED_LEFTOVERS={restored}")
+PYRESTORE
 }
 
 run_dedupe() {
@@ -2419,11 +2961,52 @@ run_dedupe() {
     fi
 }
 
-mkdir -p "\${UPLOAD}"
+process_batch() {
+    local batch="\$1"
+    local album_count single_count album_status=0 single_status=0 dedupe_status=0
+
+    album_count="\$(count_audio_tree "\${batch}/albums")"
+    single_count="\$(count_audio_tree "\${batch}/singles")"
+
+    echo "Пакет: \${batch}"
+    echo "  альбомных треков: \${album_count}"
+    echo "  одиночных треков: \${single_count}"
+
+    if (( album_count > 0 )); then
+        set +e
+        "\${BEET}" import -q "\${batch}/albums"
+        album_status=\$?
+        set -e
+    fi
+
+    if (( single_count > 0 )); then
+        set +e
+        "\${BEET}" import -q -s "\${batch}/singles"
+        single_status=\$?
+        set -e
+    fi
+
+    run_dedupe || dedupe_status=\$?
+
+    remaining="\$(( \$(count_audio_tree "\${batch}/albums") + \$(count_audio_tree "\${batch}/singles") ))"
+    echo "Коды beets: albums=\${album_status}, singles=\${single_status}; dedupe=\${dedupe_status}"
+    echo "Осталось аудиофайлов в пакете: \${remaining}"
+
+    restore_leftovers "\${batch}"
+
+    if (( album_status != 0 || single_status != 0 || dedupe_status != 0 )); then
+        echo "Пакет завершён с ошибкой; оставшиеся файлы возвращены в upload и будут повторены позже."
+        return 1
+    fi
+
+    echo "Пакет импортирован успешно."
+    return 0
+}
+
+mkdir -p "\${UPLOAD}" "\${QUEUE}"
 touch "\${UPLOAD}/.music-cloud-keep"
 
 exec 9>"\${LOCK}"
-
 if ! flock -w 600 9; then
     echo "Не удалось получить блокировку beets за 600 секунд." >>"\${LOG}"
     exit 1
@@ -2432,61 +3015,71 @@ fi
 {
     echo
     echo "===== \$(date --iso-8601=seconds) ====="
+    echo "Пакетный импорт: batch=\${BATCH_SIZE}, stable=\${STABLE_SECONDS}s"
 
-    if ! wait_for_first_audio; then
-        echo "Поддерживаемых аудиофайлов для импорта нет."
-        exit 0
-    fi
+    batches=0
+    idle=0
+    had_error=0
 
-    no_progress=0
+    while (( batches < MAX_BATCHES_PER_RUN )); do
+        batch="\$(existing_batch || true)"
 
-    while has_audio; do
-        wait_for_upload_quiet
+        if [[ -z "\${batch}" ]]; then
+            set +e
+            stage_output="\$("\${BATCHER}" "\${UPLOAD}" "\${QUEUE}" "\${BATCH_SIZE}" "\${STABLE_SECONDS}" 2>&1)"
+            stage_status=\$?
+            set -e
+            printf '%s\n' "\${stage_output}"
 
-        before_count="\$(count_audio)"
-        echo "Аудиофайлов перед импортом: \${before_count}"
-
-        set +e
-        "\${BEET}" import -q "\${UPLOAD}"
-        import_status=\$?
-        set -e
-
-        dedupe_status=0
-        run_dedupe || dedupe_status=\$?
-
-        find "\${UPLOAD}" -mindepth 1 -depth -type d -empty -delete 2>/dev/null || true
-
-        after_count="\$(count_audio)"
-        echo "beets exit status: \${import_status}"
-        echo "dedupe exit status: \${dedupe_status}"
-        echo "Аудиофайлов после импорта: \${after_count}"
-
-        if (( after_count == 0 )); then
-            if (( dedupe_status != 0 )); then
-                echo "Файлы импортированы, но замена дублей завершилась ошибкой."
-                exit "\${dedupe_status}"
+            if (( stage_status != 0 )); then
+                echo "Не удалось сформировать пакет импорта."
+                exit "\${stage_status}"
             fi
-            echo "Импорт завершён: новые версии заменили старые совпадающие треки."
-            exit "\${import_status}"
+
+            batch="\$(awk -F= '/^BATCH_PATH=/{print substr(\$0, index(\$0, \"=\") + 1)}' <<<"\${stage_output}" | tail -n 1)"
         fi
 
-        if (( after_count < before_count )); then
-            no_progress=0
-            echo "Импорт продвинулся; повторная проверка оставшихся файлов."
+        if [[ -z "\${batch}" || ! -d "\${batch}" ]]; then
+            pending="\$(count_upload_audio)"
+            if (( pending == 0 )); then
+                echo "Очередь пуста: импортировать больше нечего."
+                break
+            fi
+
+            idle=\$((idle + SCAN_INTERVAL))
+            echo "В upload осталось \${pending} треков; ждём завершения записи файлов (\${idle}/\${IDLE_EXIT_SECONDS}s)."
+
+            if (( idle >= IDLE_EXIT_SECONDS )); then
+                echo "Пока нет стабильных файлов. Watcher/таймер продолжит импорт автоматически."
+                break
+            fi
+
+            sleep "\${SCAN_INTERVAL}"
             continue
         fi
 
-        no_progress=\$((no_progress + 1))
-
-        if (( import_status != 0 || dedupe_status != 0 || no_progress >= MAX_NO_PROGRESS )); then
-            echo "Импорт не продвинулся. Оставшиеся аудиофайлы:"
-            find_audio -printf '  %P\n' | sed -n '1,100p'
-            echo "Следующая автоматическая попытка будет выполнена таймером."
-            exit 1
-        fi
-
-        sleep 10
+        idle=0
+        batches=\$((batches + 1))
+        echo "--- пакет \${batches} ---"
+        process_batch "\${batch}" || had_error=1
+        sleep 2
     done
+
+    pending="\$(count_upload_audio)"
+    echo "Обработано пакетов за запуск: \${batches}"
+    echo "Аудиофайлов осталось в upload: \${pending}"
+
+    if (( batches >= MAX_BATCHES_PER_RUN && pending > 0 )); then
+        echo "Достигнут лимит пакетов одного запуска; следующий timer продолжит очередь."
+    fi
+
+    # A failed individual batch must not stop the queue permanently. Remaining
+    # files were restored and retimestamped, so the next watcher/timer run can
+    # retry them after the stability interval.
+    if (( had_error != 0 )); then
+        echo "Некоторые пакеты завершились с ошибками; подробности выше."
+        exit 1
+    fi
 } >>"\${LOG}" 2>&1
 EOF
 
@@ -3788,6 +4381,7 @@ EOF
 
     rm -f \
         "${AUTO_IMPORT_SCRIPT}" \
+        "${IMPORT_BATCH_SCRIPT}" \
         "${UPLOAD_WATCH_SCRIPT}" \
         "${LEGACY_AUTO_IMPORT_WATCH_SCRIPT}" \
         "${DEDUPE_SCRIPT}" \
@@ -3802,6 +4396,12 @@ EOF
     if command -v caddy >/dev/null 2>&1; then
         caddy validate --config /etc/caddy/Caddyfile >/dev/null 2>&1 || true
         systemctl reload caddy 2>/dev/null || true
+    fi
+
+    if find "${IMPORT_QUEUE_DIR}" -type f -print -quit 2>/dev/null | grep -q .; then
+        warn "В очереди импорта остались файлы: ${IMPORT_QUEUE_DIR}. Они не удаляются автоматически."
+    else
+        rmdir "${IMPORT_QUEUE_DIR}" 2>/dev/null || true
     fi
 
     if ask_yes_no "Удалить только каталог загрузки ${UPLOAD_DIR}?" "n"; then
