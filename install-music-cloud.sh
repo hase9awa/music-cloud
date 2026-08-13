@@ -47,7 +47,7 @@ set -Eeuo pipefail
 # ==============================================================================
 
 APP_NAME="music-cloud"
-SCRIPT_VERSION="5.6.0-universal"
+SCRIPT_VERSION="5.6.1-universal"
 DATA_DIR="/srv/${APP_NAME}"
 STACK_DIR="/opt/${APP_NAME}"
 STATE_DIR="/etc/${APP_NAME}"
@@ -242,7 +242,7 @@ load_install_state() {
     . "${INSTALL_STATE_FILE}"
 
     case "${STATE_VERSION:-}" in
-        3|3.*|4|4.*|5.0-home-cf|5.0.1-home-cf|5.0.2-home-cf|5.1.0-universal|5.1.1-universal|5.1.2-universal|5.2.0-universal|5.2.1-universal|5.2.2-universal|5.2.3-universal|5.3.0-universal|5.4.0-universal|5.5.0-universal|5.6.0-universal)
+        3|3.*|4|4.*|5.0-home-cf|5.0.1-home-cf|5.0.2-home-cf|5.1.0-universal|5.1.1-universal|5.1.2-universal|5.2.0-universal|5.2.1-universal|5.2.2-universal|5.2.3-universal|5.3.0-universal|5.4.0-universal|5.5.0-universal|5.6.0-universal|5.6.1-universal)
             ;;
         *)
             die "Неподдерживаемая версия файла состояния ${INSTALL_STATE_FILE}."
@@ -5621,6 +5621,14 @@ BEET="${BEETS_WRAPPER}"
 DEDUPE="${DEDUPE_SCRIPT}"
 BATCHER="${IMPORT_BATCH_SCRIPT}"
 PYTHON="${BEETS_VENV}/bin/python"
+
+# Resolved by the installer and baked into this runtime script. These must be
+# runtime variables because process_batch runs later under systemd with set -u.
+METADATA_PREFLIGHT_SCRIPT="${METADATA_PREFLIGHT_SCRIPT}"
+ONLINE_ENRICH_SCRIPT="${ONLINE_ENRICH_SCRIPT}"
+ALBUM_ENRICH_SCRIPT="${ALBUM_ENRICH_SCRIPT}"
+BEETS_CONFIG_DIR="${BEETS_CONFIG_DIR}"
+
 LOG="${BEETS_CONFIG_DIR}/auto-import.log"
 LOCK="/run/lock/${APP_NAME}-beets.lock"
 
@@ -5631,6 +5639,13 @@ STABLE_SECONDS=60
 SCAN_INTERVAL=10
 IDLE_EXIT_SECONDS=120
 MAX_BATCHES_PER_RUN=100
+
+for required_helper in     "\${METADATA_PREFLIGHT_SCRIPT}"     "\${ONLINE_ENRICH_SCRIPT}"     "\${ALBUM_ENRICH_SCRIPT}"     "\${BATCHER}"; do
+    if [[ ! -x "\${required_helper}" ]]; then
+        echo "Не найден обязательный обработчик импорта: \${required_helper}" >&2
+        exit 1
+    fi
+done
 
 find_audio() {
     find "\${UPLOAD}" -type f \
@@ -5891,6 +5906,15 @@ fi
 EOF
 
     chmod 0755 "${AUTO_IMPORT_SCRIPT}"
+    bash -n "${AUTO_IMPORT_SCRIPT}" ||
+        die "Сгенерированный ${AUTO_IMPORT_SCRIPT} содержит синтаксическую ошибку."
+
+    grep -Fq 'METADATA_PREFLIGHT_SCRIPT=' "${AUTO_IMPORT_SCRIPT}" ||
+        die "В ${AUTO_IMPORT_SCRIPT} отсутствует путь к metadata-preflight."
+    grep -Fq 'ONLINE_ENRICH_SCRIPT=' "${AUTO_IMPORT_SCRIPT}" ||
+        die "В ${AUTO_IMPORT_SCRIPT} отсутствует путь к online-enrich."
+    grep -Fq 'ALBUM_ENRICH_SCRIPT=' "${AUTO_IMPORT_SCRIPT}" ||
+        die "В ${AUTO_IMPORT_SCRIPT} отсутствует путь к album-enrich."
 
     # systemd.path использует inotify только для указанного каталога и не
     # наблюдает вложенные каталоги рекурсивно. Copyparty часто загружает альбом
