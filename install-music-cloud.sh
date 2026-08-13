@@ -47,7 +47,7 @@ set -Eeuo pipefail
 # ==============================================================================
 
 APP_NAME="music-cloud"
-SCRIPT_VERSION="5.6.3-universal"
+SCRIPT_VERSION="5.6.4-universal"
 DATA_DIR="/srv/${APP_NAME}"
 STACK_DIR="/opt/${APP_NAME}"
 STATE_DIR="/etc/${APP_NAME}"
@@ -242,7 +242,7 @@ load_install_state() {
     . "${INSTALL_STATE_FILE}"
 
     case "${STATE_VERSION:-}" in
-        3|3.*|4|4.*|5.0-home-cf|5.0.1-home-cf|5.0.2-home-cf|5.1.0-universal|5.1.1-universal|5.1.2-universal|5.2.0-universal|5.2.1-universal|5.2.2-universal|5.2.3-universal|5.3.0-universal|5.4.0-universal|5.5.0-universal|5.6.0-universal|5.6.1-universal|5.6.2-universal|5.6.3-universal)
+        3|3.*|4|4.*|5.0-home-cf|5.0.1-home-cf|5.0.2-home-cf|5.1.0-universal|5.1.1-universal|5.1.2-universal|5.2.0-universal|5.2.1-universal|5.2.2-universal|5.2.3-universal|5.3.0-universal|5.4.0-universal|5.5.0-universal|5.6.0-universal|5.6.1-universal|5.6.2-universal|5.6.3-universal|5.6.4-universal)
             ;;
         *)
             die "Неподдерживаемая версия файла состояния ${INSTALL_STATE_FILE}."
@@ -3449,7 +3449,7 @@ CAA_BASE = "https://coverartarchive.org"
 ITUNES_URL = "https://itunes.apple.com/search"
 USER_AGENT = "MusicCloud/5.5.0 (https://github.com/hase9awa/music-cloud)"
 REQUEST_INTERVAL = 1.10
-REQUEST_TIMEOUT = 15
+REQUEST_TIMEOUT = 10
 MAX_FAILURES = 3
 
 MAX_RECORDING_RESULTS = 8
@@ -4153,7 +4153,7 @@ def download_image(url: str) -> bytes | None:
     try:
         response = http.get(
             url,
-            timeout=25,
+            timeout=8,
             allow_redirects=True,
             headers={
                 "User-Agent": USER_AGENT,
@@ -4176,7 +4176,7 @@ def caa_front_url(kind: str, mbid: str) -> str:
     try:
         response = http.get(
             f"{CAA_BASE}/{kind}/{mbid}",
-            timeout=20,
+            timeout=8,
             headers={
                 "User-Agent": USER_AGENT,
                 "Accept": "application/json",
@@ -4248,7 +4248,7 @@ def sibling_release_ids(release_group_id: str) -> list[str]:
         value = plain(release.get("id"))
         if value not in result:
             result.append(value)
-        if len(result) >= 8:
+        if len(result) >= 2:
             break
     return result
 
@@ -4265,7 +4265,7 @@ def itunes_cover_url(albumartist: str, album: str) -> str:
                 "media": "music",
                 "limit": 50,
             },
-            timeout=20,
+            timeout=8,
             headers={"User-Agent": USER_AGENT},
         )
         response.raise_for_status()
@@ -4751,7 +4751,7 @@ CAA_BASE = "https://coverartarchive.org"
 ITUNES_URL = "https://itunes.apple.com/search"
 USER_AGENT = "MusicCloud/5.6.0 (https://github.com/hase9awa/music-cloud)"
 REQUEST_INTERVAL = 1.10
-REQUEST_TIMEOUT = 15
+REQUEST_TIMEOUT = 10
 MAX_FAILURES = 3
 MIN_MARGIN = 0.08
 
@@ -5038,12 +5038,13 @@ def source_candidates(
     # If the title is just the untouched filename and the dash is ambiguous,
     # test both filename orientations. Network is only a disambiguator here;
     # the final artist/title values still come from the filename sides.
-    if (not artist_ok or title_is_raw_filename) and filename_orientations(path):
-        result.extend(filename_orientations(path))
+    orientations = filename_orientations(path)
+    if (not artist_ok or title_is_raw_filename) and orientations:
+        result.extend(orientations)
 
-    # Title-only fallback. This may fill a missing artist from MusicBrainz, but
-    # only under a strict confidence threshold.
-    if title_ok and not artist_ok:
+    # Do not query the entire "Title - Artist" filename again when a clear dash
+    # split already exists. This removes a third redundant MusicBrainz query.
+    if title_ok and not artist_ok and not orientations:
         result.append(("", current_title, "title-only"))
 
     # De-duplicate preserving priority order.
@@ -5158,11 +5159,15 @@ def best_match(
     title: str,
     duration: float,
 ) -> tuple[dict[str, Any], float, str, str, str] | None:
-    ranked: list[tuple[float, dict[str, Any], str, str, str]] = []
+    all_ranked: list[tuple[float, dict[str, Any], str, str, str]] = []
 
     for source_artist, source_title, reason in source_candidates(
         path, artist, title
     ):
+        local_ranked: list[
+            tuple[float, dict[str, Any], str, str, str]
+        ] = []
+
         for row in search_recordings(source_title, source_artist):
             score, metrics = row_score(
                 source_artist,
@@ -5178,20 +5183,36 @@ def best_match(
                 metrics,
             ):
                 continue
-            ranked.append(
+            local_ranked.append(
                 (score, row, source_artist, source_title, reason)
             )
 
-    if not ranked:
+        local_ranked.sort(key=lambda item: item[0], reverse=True)
+        if local_ranked:
+            best = local_ranked[0]
+            # A very strong orientation can be accepted immediately. The
+            # alternative filename orientation is only queried when needed.
+            if best[0] >= 0.90:
+                if len(local_ranked) == 1:
+                    return best[1], best[0], best[2], best[3], best[4]
+                best_id = plain(best[1].get("id"))
+                second_id = plain(local_ranked[1][1].get("id"))
+                if (
+                    (best_id and best_id == second_id)
+                    or best[0] - local_ranked[1][0] >= MIN_MARGIN
+                ):
+                    return best[1], best[0], best[2], best[3], best[4]
+
+            all_ranked.extend(local_ranked)
+
+    if not all_ranked:
         return None
 
-    ranked.sort(key=lambda item: item[0], reverse=True)
-    best = ranked[0]
-    if len(ranked) > 1 and best[0] - ranked[1][0] < MIN_MARGIN:
-        # The same MusicBrainz recording can appear via both candidate
-        # orientations. That is not real ambiguity.
+    all_ranked.sort(key=lambda item: item[0], reverse=True)
+    best = all_ranked[0]
+    if len(all_ranked) > 1 and best[0] - all_ranked[1][0] < MIN_MARGIN:
         best_id = plain(best[1].get("id"))
-        second_id = plain(ranked[1][1].get("id"))
+        second_id = plain(all_ranked[1][1].get("id"))
         if not best_id or best_id != second_id:
             return None
 
@@ -5340,7 +5361,7 @@ def download_image(url: str) -> bytes | None:
     try:
         response = http.get(
             url,
-            timeout=25,
+            timeout=8,
             allow_redirects=True,
             headers={
                 "User-Agent": USER_AGENT,
@@ -5364,7 +5385,7 @@ def caa_front_url(kind: str, mbid: str) -> str:
     try:
         response = http.get(
             f"{CAA_BASE}/{kind}/{mbid}",
-            timeout=20,
+            timeout=8,
             headers={
                 "User-Agent": USER_AGENT,
                 "Accept": "application/json",
@@ -5445,7 +5466,7 @@ def sibling_release_ids(release_group_id: str) -> list[str]:
         release_id = plain(release.get("id"))
         if release_id not in result:
             result.append(release_id)
-        if len(result) >= 8:
+        if len(result) >= 2:
             break
     return result
 
@@ -5463,7 +5484,7 @@ def itunes_cover_url(albumartist: str, album: str) -> str:
                 "media": "music",
                 "limit": 50,
             },
-            timeout=20,
+            timeout=8,
             headers={"User-Agent": USER_AGENT},
         )
         response.raise_for_status()
@@ -5814,39 +5835,60 @@ def main() -> int:
     matched = 0
     skipped = 0
 
+    paths: list[Path] = []
+    seen: set[str] = set()
     for root_name in sys.argv[1:]:
         root = Path(root_name)
         if not root.exists():
             continue
-
         candidates = [root] if root.is_file() else root.rglob("*")
         for path in candidates:
-            if failures >= MAX_FAILURES:
-                print(
-                    "ONLINE-WARN: MusicBrainz disabled for the rest of "
-                    "this batch after repeated failures."
-                )
-                print(f"ONLINE_MATCHED={matched}")
-                print(f"ONLINE_SKIPPED={skipped}")
-                return 0
-
             if (
                 not path.is_file()
                 or path.suffix.casefold() not in AUDIO_EXTENSIONS
             ):
                 continue
+            try:
+                key = str(path.resolve())
+            except OSError:
+                key = str(path)
+            if key in seen:
+                continue
+            seen.add(key)
+            paths.append(path)
 
-            ok, message = process(path)
-            if ok:
-                matched += 1
-                print(f"ONLINE-MATCH: {path.name}: {message}")
-            else:
-                skipped += 1
-                if message not in {"metadata already complete"}:
-                    print(f"ONLINE-SKIP: {path.name}: {message}")
+    total = len(paths)
+    for index, path in enumerate(paths, start=1):
+        print(
+            f"ONLINE-PROGRESS: {index}/{total}: {path.name}",
+            flush=True,
+        )
 
-    print(f"ONLINE_MATCHED={matched}")
-    print(f"ONLINE_SKIPPED={skipped}")
+        if failures >= MAX_FAILURES:
+            print(
+                "ONLINE-WARN: MusicBrainz disabled for the rest of "
+                "this batch after repeated failures.",
+                flush=True,
+            )
+            break
+
+        ok, message = process(path)
+        if ok:
+            matched += 1
+            print(
+                f"ONLINE-MATCH: {path.name}: {message}",
+                flush=True,
+            )
+        else:
+            skipped += 1
+            if message not in {"metadata already complete"}:
+                print(
+                    f"ONLINE-SKIP: {path.name}: {message}",
+                    flush=True,
+                )
+
+    print(f"ONLINE_MATCHED={matched}", flush=True)
+    print(f"ONLINE_SKIPPED={skipped}", flush=True)
     return 0
 
 
@@ -6205,11 +6247,15 @@ LOCK="/run/lock/${APP_NAME}-beets.lock"
 
 # A batch is deliberately small enough for low-cost VPS instances, while a
 # long-running service can drain many batches sequentially.
-BATCH_SIZE=200
+BATCH_SIZE=25
 STABLE_SECONDS=60
 SCAN_INTERVAL=10
 IDLE_EXIT_SECONDS=120
 MAX_BATCHES_PER_RUN=100
+
+# Python helpers write directly into auto-import.log. Disable block buffering so
+# ONLINE-PROGRESS/ONLINE-MATCH lines are visible immediately with tail -f.
+export PYTHONUNBUFFERED=1
 
 for required_helper in     "\${METADATA_PREFLIGHT_SCRIPT}"     "\${ONLINE_ENRICH_SCRIPT}"     "\${ALBUM_ENRICH_SCRIPT}"     "\${BATCHER}"; do
     if [[ ! -x "\${required_helper}" ]]; then
@@ -7835,8 +7881,54 @@ repair_import_automation() {
     load_install_state
     resolve_deployment_mode
     check_os
+
+    # Stop all import triggers before replacing the running importer.
+    systemctl stop "${AUTO_IMPORT_TIMER}" "${AUTO_IMPORT_PATH}"         "${UPLOAD_WATCH_SERVICE}" "${AUTO_IMPORT_SERVICE}" 2>/dev/null || true
+
     install_base_packages
     create_directories
+
+    # Requeue unfinished batches from older importer versions. Files are not
+    # deleted; any metadata already written into them is preserved.
+    if [[ -d "${IMPORT_QUEUE_DIR}" ]]; then
+        python3 - "${IMPORT_QUEUE_DIR}" "${UPLOAD_DIR}" <<'PYREQUEUE'
+from __future__ import annotations
+import os
+import shutil
+import sys
+import time
+from pathlib import Path
+
+queue = Path(sys.argv[1])
+upload = Path(sys.argv[2])
+restored = 0
+
+for batch in sorted(queue.glob("batch-*")):
+    if not batch.is_dir():
+        continue
+    for mode in ("albums", "singles"):
+        root = batch / mode
+        if not root.exists():
+            continue
+        for path in sorted(root.rglob("*")):
+            if not path.is_file():
+                continue
+            rel = path.relative_to(root)
+            target = upload / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if target.exists():
+                stamp = time.strftime("%Y%m%d-%H%M%S")
+                target = target.with_name(
+                    f"{target.stem}.music-cloud-requeue-{stamp}-{os.getpid()}"
+                    f"{target.suffix}"
+                )
+            os.replace(path, target)
+            restored += 1
+    shutil.rmtree(batch, ignore_errors=True)
+
+print(f"REQUEUED_IMPORT_FILES={restored}")
+PYREQUEUE
+    fi
 
     # Reinstalling beets is intentional: this adds Pillow/ArtResizer, whose
     # absence lets recognition finish but makes fetchart/embedart fail before
@@ -7848,7 +7940,7 @@ repair_import_automation() {
 
     # Clean duplicate database/file entries created by earlier importer versions.
     run_as_owner "${DEDUPE_SCRIPT}" || warn "Не удалось полностью очистить старые дубли; импорт продолжится."
-    systemctl start "${AUTO_IMPORT_SERVICE}" || true
+    systemctl start --no-block "${AUTO_IMPORT_SERVICE}" || true
 
     ok "Механизм импорта восстановлен."
     systemctl status "${UPLOAD_WATCH_SERVICE}" --no-pager -l || true
