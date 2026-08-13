@@ -47,7 +47,7 @@ set -Eeuo pipefail
 # ==============================================================================
 
 APP_NAME="music-cloud"
-SCRIPT_VERSION="5.1.0-universal"
+SCRIPT_VERSION="5.1.1-universal"
 DATA_DIR="/srv/${APP_NAME}"
 STACK_DIR="/opt/${APP_NAME}"
 STATE_DIR="/etc/${APP_NAME}"
@@ -235,7 +235,7 @@ load_install_state() {
     . "${INSTALL_STATE_FILE}"
 
     case "${STATE_VERSION:-}" in
-        3|3.*|4|4.*|5.0-home-cf|5.0.1-home-cf|5.0.2-home-cf|5.1.0-universal)
+        3|3.*|4|4.*|5.0-home-cf|5.0.1-home-cf|5.0.2-home-cf|5.1.0-universal|5.1.1-universal)
             ;;
         *)
             die "Неподдерживаемая версия файла состояния ${INSTALL_STATE_FILE}."
@@ -1218,6 +1218,75 @@ install_beets() {
         requests \
         pyacoustid \
         Pillow
+
+    # beets 2.4.0 использует слишком короткий буфер fcntl.ioctl() для
+    # определения ширины терминала. Python 3.14 обнаруживает переполнение и
+    # завершает импорт beets с SystemError: buffer overflow. Применяем точечный
+    # backport upstream-исправления через shutil.get_terminal_size(), сохраняя
+    # beets 2.4.0 для совместимости с Debian 11 / Python 3.9.
+    # Патч идемпотентен и выполняется до первого импорта beets.ui.
+    run_as_owner "${BEETS_VENV}/bin/python" - <<'PYBEETSTERM'
+from pathlib import Path
+import importlib.util
+
+spec = importlib.util.find_spec("beets")
+if spec is None or not spec.submodule_search_locations:
+    raise SystemExit("Не удалось найти установленный пакет beets")
+
+ui_path = Path(next(iter(spec.submodule_search_locations))) / "ui" / "__init__.py"
+text = ui_path.read_text(encoding="utf-8")
+
+old_function = "".join([
+    'def term_width():\n',
+    '    """Get the width (columns) of the terminal."""\n',
+    '    fallback = config["ui"]["terminal_width"].get(int)\n',
+    '\n',
+    '    # The fcntl and termios modules are not available on non-Unix\n',
+    '    # platforms, so we fall back to a constant.\n',
+    '    try:\n',
+    '        import fcntl\n',
+    '        import termios\n',
+    '    except ImportError:\n',
+    '        return fallback\n',
+    '\n',
+    '    try:\n',
+    '        buf = fcntl.ioctl(0, termios.TIOCGWINSZ, " " * 4)\n',
+    '    except OSError:\n',
+    '        return fallback\n',
+    '\n',
+    '    try:\n',
+    '        height, width = struct.unpack("hh", buf)\n',
+    '    except struct.error:\n',
+    '        return fallback\n',
+    '    return width\n',
+])
+
+new_function = "".join([
+    'def term_width():\n',
+    '    """Get the width (columns) of the terminal."""\n',
+    '    columns, _ = shutil.get_terminal_size(fallback=(0, 0))\n',
+    '    return columns if columns else config["ui"]["terminal_width"].get(int)\n',
+])
+
+if "shutil.get_terminal_size(fallback=(0, 0))" in text:
+    print("beets terminal-width patch already applied")
+    raise SystemExit(0)
+
+if old_function not in text:
+    raise SystemExit(
+        f"Не удалось применить Python 3.14 patch к {ui_path}: "
+        "структура beets.ui отличается от ожидаемой"
+    )
+
+if "import shutil\n" not in text:
+    marker = "import re\n"
+    if marker not in text:
+        raise SystemExit(f"Не удалось добавить import shutil в {ui_path}")
+    text = text.replace(marker, marker + "import shutil\n", 1)
+
+ui_path.write_text(text.replace(old_function, new_function, 1), encoding="utf-8")
+print(f"beets Python 3.14 terminal-width patch applied: {ui_path}")
+PYBEETSTERM
 
     cat > "${BEETS_CONFIG_FILE}" <<EOF
 directory: ${LIBRARY_DIR}
