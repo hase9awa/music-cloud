@@ -47,7 +47,7 @@ set -Eeuo pipefail
 # ==============================================================================
 
 APP_NAME="music-cloud"
-SCRIPT_VERSION="5.2.3-universal"
+SCRIPT_VERSION="5.3.0-universal"
 DATA_DIR="/srv/${APP_NAME}"
 STACK_DIR="/opt/${APP_NAME}"
 STATE_DIR="/etc/${APP_NAME}"
@@ -86,6 +86,7 @@ CREDENTIALS_FILE="/root/${APP_NAME}-credentials.txt"
 AUTO_IMPORT_SCRIPT="/usr/local/bin/${APP_NAME}-auto-import"
 IMPORT_BATCH_SCRIPT="/usr/local/bin/${APP_NAME}-stage-import-batch"
 METADATA_PREFLIGHT_SCRIPT="/usr/local/bin/${APP_NAME}-metadata-preflight"
+ONLINE_ENRICH_SCRIPT="/usr/local/bin/${APP_NAME}-online-enrich"
 DEDUPE_SCRIPT="/usr/local/bin/${APP_NAME}-dedupe"
 BEETS_WRAPPER="/usr/local/bin/${APP_NAME}-beet"
 BEETS_UPDATE_SCRIPT="/usr/local/bin/${APP_NAME}-beets-update"
@@ -240,7 +241,7 @@ load_install_state() {
     . "${INSTALL_STATE_FILE}"
 
     case "${STATE_VERSION:-}" in
-        3|3.*|4|4.*|5.0-home-cf|5.0.1-home-cf|5.0.2-home-cf|5.1.0-universal|5.1.1-universal|5.1.2-universal|5.2.0-universal|5.2.1-universal|5.2.2-universal|5.2.3-universal)
+        3|3.*|4|4.*|5.0-home-cf|5.0.1-home-cf|5.0.2-home-cf|5.1.0-universal|5.1.1-universal|5.1.2-universal|5.2.0-universal|5.2.1-universal|5.2.2-universal|5.2.3-universal|5.3.0-universal)
             ;;
         *)
             die "Неподдерживаемая версия файла состояния ${INSTALL_STATE_FILE}."
@@ -3330,7 +3331,7 @@ def process(path: Path, artists: list[str]) -> tuple[bool, str]:
     # The source filename is the final invariant: even if no online service can
     # identify the recording, the title must never collapse to "Singles.1",
     # 00-00, or another path-derived placeholder.
-    fallback_title = stem
+    fallback_title = humanize(strip_track_prefix(stem)) or stem
 
     changes: list[str] = []
     if need_artist and guessed_artist:
@@ -3406,6 +3407,402 @@ PYMUSICCLOUDPREFLIGHT
 
     chmod 0755 "${METADATA_PREFLIGHT_SCRIPT}"
     "${BEETS_VENV}/bin/python" -m py_compile "${METADATA_PREFLIGHT_SCRIPT}"
+
+    cat > "${ONLINE_ENRICH_SCRIPT}" <<'PYMUSICCLOUDONLINE'
+#!/opt/music-cloud/beets-venv/bin/python
+from __future__ import annotations
+
+import re
+import sys
+import time
+import unicodedata
+from difflib import SequenceMatcher
+from pathlib import Path
+from typing import Any
+
+import requests
+from mutagen import File as MutagenFile
+
+
+AUDIO_EXTENSIONS = {
+    ".mp3", ".flac", ".m4a", ".mp4", ".ogg", ".opus", ".wav", ".wave",
+    ".aif", ".aiff", ".alac", ".wma", ".ape", ".mpc", ".tta", ".dsf", ".dff",
+}
+PLACEHOLDERS = {
+    "", "unknown", "unknown artist", "unknown title", "unknown track",
+    "untitled", "none", "n/a", "na", "<unknown>", "(unknown)",
+    "singles", "singles.1", "00-00", "0",
+}
+
+MB_URL = "https://musicbrainz.org/ws/2/recording/"
+USER_AGENT = "MusicCloud/5.3.0 (https://github.com/hase9awa/music-cloud)"
+REQUEST_INTERVAL = 1.10
+REQUEST_TIMEOUT = 12
+MAX_FAILURES = 3
+
+http = requests.Session()
+http.headers.update({"User-Agent": USER_AGENT, "Accept": "application/json"})
+last_request = 0.0
+failures = 0
+cache: dict[str, list[dict[str, Any]]] = {}
+
+
+def plain(value: object) -> str:
+    if isinstance(value, (list, tuple)):
+        value = value[0] if value else ""
+    return str(value or "").strip()
+
+
+def humanize(value: str) -> str:
+    value = unicodedata.normalize("NFKC", value)
+    value = re.sub(r"[_\s]+", " ", value)
+    return value.strip(" ._-–—")
+
+
+def norm(value: object) -> str:
+    value = humanize(plain(value)).casefold()
+    value = re.sub(r"[^\w]+", " ", value, flags=re.UNICODE)
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def missing(value: object) -> bool:
+    return norm(value) in PLACEHOLDERS
+
+
+def artist_credit(value: Any) -> str:
+    if not isinstance(value, list):
+        return ""
+    out: list[str] = []
+    for part in value:
+        if not isinstance(part, dict):
+            continue
+        name = plain(part.get("name"))
+        if not name and isinstance(part.get("artist"), dict):
+            name = plain(part["artist"].get("name"))
+        if name:
+            out.append(name)
+        join = plain(part.get("joinphrase"))
+        if join:
+            out.append(join)
+    return "".join(out).strip()
+
+
+def variants(title: str) -> list[str]:
+    words = humanize(title).split()
+    result: list[str] = []
+
+    def add(value: str) -> None:
+        value = humanize(value)
+        if len(value) >= 2 and value not in result:
+            result.append(value)
+
+    add(" ".join(words))
+    if len(words) >= 3:
+        # Downloader/source names often have one extra suffix that is not part
+        # of the canonical recording title.
+        add(" ".join(words[:-1]))
+        add(" ".join(words[:2]))
+        add(" ".join(words[-2:]))
+    if len(words) >= 4:
+        add(" ".join(words[:-2]))
+    return result[:5]
+
+
+def request_search(title: str) -> list[dict[str, Any]]:
+    global last_request, failures
+
+    key = norm(title)
+    if key in cache:
+        return cache[key]
+    if failures >= MAX_FAILURES:
+        return []
+
+    delay = REQUEST_INTERVAL - (time.monotonic() - last_request)
+    if delay > 0:
+        time.sleep(delay)
+
+    escaped = title.replace("\\", "\\\\").replace('"', '\\"')
+    try:
+        response = http.get(
+            MB_URL,
+            params={
+                "query": f'recording:"{escaped}"',
+                "fmt": "json",
+                "limit": 10,
+            },
+            timeout=REQUEST_TIMEOUT,
+        )
+        last_request = time.monotonic()
+        if response.status_code in {429, 503}:
+            failures += 1
+            cache[key] = []
+            return []
+        response.raise_for_status()
+        failures = 0
+        data = response.json()
+    except Exception as exc:
+        last_request = time.monotonic()
+        failures += 1
+        print(f"ONLINE-WARN: MusicBrainz: {exc}")
+        cache[key] = []
+        return []
+
+    rows = data.get("recordings", []) if isinstance(data, dict) else []
+    result = [row for row in rows if isinstance(row, dict)]
+    cache[key] = result
+    return result
+
+
+def score(query: str, duration: float, row: dict[str, Any]) -> tuple[float, float]:
+    q = norm(query)
+    title = norm(row.get("title"))
+    if not q or not title:
+        return 0.0, 9999.0
+
+    similarity = SequenceMatcher(None, q, title).ratio()
+    qtokens = set(q.split())
+    ttokens = set(title.split())
+    overlap = len(qtokens & ttokens) / max(len(qtokens), len(ttokens))
+
+    try:
+        mb_score = float(row.get("score", 0) or 0) / 100.0
+    except (TypeError, ValueError):
+        mb_score = 0.0
+
+    try:
+        candidate_duration = float(row.get("length")) / 1000.0
+        diff = abs(duration - candidate_duration)
+        duration_score = max(0.0, 1.0 - diff / 18.0)
+    except (TypeError, ValueError):
+        diff = 9999.0
+        duration_score = 0.25
+
+    total = (
+        0.44 * similarity
+        + 0.20 * overlap
+        + 0.26 * duration_score
+        + 0.10 * mb_score
+    )
+    return total, diff
+
+
+def choose(title: str, duration: float) -> tuple[dict[str, Any], float, str] | None:
+    found: dict[str, tuple[float, float, dict[str, Any], str]] = {}
+
+    for query in variants(title):
+        for row in request_search(query):
+            mbid = plain(row.get("id"))
+            if not mbid:
+                continue
+
+            value, diff = score(query, duration, row)
+            title_sim = SequenceMatcher(None, norm(query), norm(row.get("title"))).ratio()
+            qtokens = set(norm(query).split())
+            rtokens = set(norm(row.get("title")).split())
+            overlap = len(qtokens & rtokens) / max(1, max(len(qtokens), len(rtokens)))
+
+            # Unknown-artist search is intentionally conservative:
+            # title words must substantially agree and duration must be close.
+            if value < 0.78 or title_sim < 0.62 or overlap < 0.50 or diff > 8.0:
+                continue
+
+            old = found.get(mbid)
+            candidate = (value, diff, row, query)
+            if old is None or value > old[0]:
+                found[mbid] = candidate
+
+        if found and max(value[0] for value in found.values()) >= 0.93:
+            break
+        if failures >= MAX_FAILURES:
+            break
+
+    if not found:
+        return None
+
+    ranked = sorted(found.values(), key=lambda item: item[0], reverse=True)
+    if len(ranked) > 1 and ranked[0][0] - ranked[1][0] < 0.06:
+        return None
+
+    return ranked[0][2], ranked[0][0], ranked[0][3]
+
+
+def best_release(row: dict[str, Any]) -> dict[str, Any] | None:
+    releases = row.get("releases")
+    if not isinstance(releases, list):
+        return None
+
+    valid = [r for r in releases if isinstance(r, dict) and plain(r.get("id"))]
+    if not valid:
+        return None
+
+    def key(release: dict[str, Any]) -> tuple[int, int, int, str]:
+        status = plain(release.get("status")).casefold()
+        rg = release.get("release-group")
+        primary = ""
+        secondary: list[str] = []
+        if isinstance(rg, dict):
+            primary = plain(rg.get("primary-type")).casefold()
+            raw = rg.get("secondary-types")
+            if isinstance(raw, list):
+                secondary = [plain(x).casefold() for x in raw]
+        return (
+            -int(status == "official"),
+            -int("compilation" not in secondary),
+            -int(primary in {"album", "single", "ep"}),
+            plain(release.get("date")) or "9999",
+        )
+
+    valid.sort(key=key)
+    return valid[0]
+
+
+def get_values(audio: Any) -> tuple[str, str]:
+    if not getattr(audio, "tags", None):
+        return "", ""
+    try:
+        artist = plain(audio.tags.get("artist", []))
+    except Exception:
+        artist = ""
+    try:
+        title = plain(audio.tags.get("title", []))
+    except Exception:
+        title = ""
+    return artist, title
+
+
+def set_tag(audio: Any, key: str, value: str) -> bool:
+    if not value:
+        return False
+    try:
+        audio.tags[key] = [value]
+        return True
+    except Exception:
+        try:
+            audio[key] = value
+            return True
+        except Exception:
+            return False
+
+
+def process(path: Path) -> tuple[bool, str]:
+    try:
+        audio = MutagenFile(path, easy=True)
+    except Exception as exc:
+        return False, f"read error: {exc}"
+    if audio is None:
+        return False, "unsupported audio"
+
+    if getattr(audio, "tags", None) is None:
+        try:
+            audio.add_tags()
+        except Exception:
+            pass
+
+    artist, title = get_values(audio)
+
+    # Existing artist+title goes through normal beets/AcoustID. Direct title-only
+    # MusicBrainz search is for the hard case seen with downloader filenames.
+    if not title or missing(title) or not missing(artist):
+        return False, "not title-only"
+
+    try:
+        duration = float(audio.info.length)
+    except Exception:
+        return False, "no duration"
+
+    match = choose(humanize(title), duration)
+    if not match:
+        return False, "no confident match"
+
+    row, confidence, used_query = match
+    canonical_title = plain(row.get("title"))
+    canonical_artist = artist_credit(row.get("artist-credit"))
+    release = best_release(row)
+
+    album = plain(release.get("title")) if release else ""
+    date = plain(release.get("date")) if release else ""
+    release_id = plain(release.get("id")) if release else ""
+    recording_id = plain(row.get("id"))
+
+    changed: list[str] = []
+    for key, value in (
+        ("artist", canonical_artist),
+        ("title", canonical_title),
+        ("album", album),
+        ("albumartist", canonical_artist),
+        ("date", date[:4] if re.match(r"^\d{4}", date) else date),
+        ("musicbrainz_trackid", recording_id),
+        ("musicbrainz_albumid", release_id),
+    ):
+        if set_tag(audio, key, value):
+            changed.append(f"{key}={value}")
+
+    isrcs = row.get("isrcs")
+    if isinstance(isrcs, list) and isrcs:
+        isrc = plain(isrcs[0])
+        if set_tag(audio, "isrc", isrc):
+            changed.append(f"isrc={isrc}")
+
+    if not changed:
+        return False, "matched but tags not writable"
+
+    try:
+        audio.save()
+    except Exception as exc:
+        return False, f"save error: {exc}"
+
+    return True, (
+        f"score={confidence:.3f}; query={used_query!r}; "
+        f"{canonical_artist!r} — {canonical_title!r}; album={album!r}"
+    )
+
+
+def main() -> int:
+    if len(sys.argv) < 2:
+        return 2
+
+    matched = 0
+    skipped = 0
+
+    for root_name in sys.argv[1:]:
+        root = Path(root_name)
+        if not root.exists():
+            continue
+        candidates = [root] if root.is_file() else root.rglob("*")
+
+        for path in candidates:
+            if failures >= MAX_FAILURES:
+                print(
+                    "ONLINE-WARN: MusicBrainz disabled for the rest of this "
+                    "batch after repeated failures."
+                )
+                print(f"ONLINE_MATCHED={matched}")
+                print(f"ONLINE_SKIPPED={skipped}")
+                return 0
+
+            if not path.is_file() or path.suffix.casefold() not in AUDIO_EXTENSIONS:
+                continue
+
+            ok, message = process(path)
+            if ok:
+                matched += 1
+                print(f"ONLINE-MATCH: {path.name}: {message}")
+            else:
+                skipped += 1
+                if message not in {"not title-only"}:
+                    print(f"ONLINE-SKIP: {path.name}: {message}")
+
+    print(f"ONLINE_MATCHED={matched}")
+    print(f"ONLINE_SKIPPED={skipped}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+PYMUSICCLOUDONLINE
+
+    chmod 0755 "${ONLINE_ENRICH_SCRIPT}"
+    "${BEETS_VENV}/bin/python" -m py_compile "${ONLINE_ENRICH_SCRIPT}"
 
     cat > "${IMPORT_BATCH_SCRIPT}" <<'PYMUSICCLOUDBATCH'
 #!/usr/bin/env python3
@@ -3839,6 +4236,10 @@ process_batch() {
 
     echo "Предварительное восстановление метаданных из исходных имён файлов..."
     "\${PYTHON}" "${METADATA_PREFLIGHT_SCRIPT}" "${BEETS_CONFIG_DIR}/library.db" \
+        "\${batch}/albums" "\${batch}/singles" || true
+
+    echo "Поиск полной метадаты для title-only треков через MusicBrainz..."
+    "\${PYTHON}" "${ONLINE_ENRICH_SCRIPT}" \
         "\${batch}/albums" "\${batch}/singles" || true
 
     # Stage 1: normal beets autotagging. This uses MusicBrainz/AcoustID and all
@@ -5302,6 +5703,7 @@ EOF
         "${AUTO_IMPORT_SCRIPT}" \
         "${IMPORT_BATCH_SCRIPT}" \
         "${METADATA_PREFLIGHT_SCRIPT}" \
+        "${ONLINE_ENRICH_SCRIPT}" \
         "${UPLOAD_WATCH_SCRIPT}" \
         "${LEGACY_AUTO_IMPORT_WATCH_SCRIPT}" \
         "${DEDUPE_SCRIPT}" \
