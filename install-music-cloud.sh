@@ -47,7 +47,7 @@ set -Eeuo pipefail
 # ==============================================================================
 
 APP_NAME="music-cloud"
-SCRIPT_VERSION="5.6.4-universal"
+SCRIPT_VERSION="5.6.5-universal"
 DATA_DIR="/srv/${APP_NAME}"
 STACK_DIR="/opt/${APP_NAME}"
 STATE_DIR="/etc/${APP_NAME}"
@@ -242,7 +242,7 @@ load_install_state() {
     . "${INSTALL_STATE_FILE}"
 
     case "${STATE_VERSION:-}" in
-        3|3.*|4|4.*|5.0-home-cf|5.0.1-home-cf|5.0.2-home-cf|5.1.0-universal|5.1.1-universal|5.1.2-universal|5.2.0-universal|5.2.1-universal|5.2.2-universal|5.2.3-universal|5.3.0-universal|5.4.0-universal|5.5.0-universal|5.6.0-universal|5.6.1-universal|5.6.2-universal|5.6.3-universal|5.6.4-universal)
+        3|3.*|4|4.*|5.0-home-cf|5.0.1-home-cf|5.0.2-home-cf|5.1.0-universal|5.1.1-universal|5.1.2-universal|5.2.0-universal|5.2.1-universal|5.2.2-universal|5.2.3-universal|5.3.0-universal|5.4.0-universal|5.5.0-universal|5.6.0-universal|5.6.1-universal|5.6.2-universal|5.6.3-universal|5.6.4-universal|5.6.5-universal)
             ;;
         *)
             die "Неподдерживаемая версия файла состояния ${INSTALL_STATE_FILE}."
@@ -3154,6 +3154,18 @@ def known_artists(library_db: str) -> list[str]:
     except Exception:
         return []
 
+    # Never learn malformed artist values from previous bad imports.
+    unsafe = re.compile(
+        r"(?:\s[-–—]\s|\bprod\.?\s*(?:by\b|\.)|\bslowed\b|"
+        r"\bsped\s*up\b|\breverb\b)",
+        re.IGNORECASE,
+    )
+    result = {
+        value for value in result
+        if not unsafe.search(value)
+        and fold(value) not in {"singles", "unknown artist"}
+    }
+
     return sorted(
         result,
         key=lambda value: len(normalized_tokens(value)),
@@ -3213,26 +3225,9 @@ def parse_filename(
     raw = strip_track_prefix(stem)
     human = humanize(raw)
 
-    by_known = split_by_known_artist(raw, artists)
-    if by_known:
-        return by_known
-
-    # Title by Artist.
-    match = re.match(r"^(.+?)\s+by\s+(.+)$", human, flags=re.IGNORECASE)
-    if match:
-        title = humanize(match.group(1))
-        artist = humanize(match.group(2))
-        if artist and title:
-            return artist, title
-
-    # Double underscores are treated as ordinary title separators. They are
-    # common in downloader filenames and are too ambiguous to mean Artist__Title.
-
-    comma = split_comma_collaboration(raw)
-    if comma:
-        return comma
-
-    # Explicit spaced dash is ambiguous without corroborating tags.
+    # "Title - Artist" and "Artist - Title" are both common. Handle this
+    # separator BEFORE the broad known-artist matcher so a malformed artist
+    # from an older import can never consume text across the dash.
     match = re.match(r"^(.+?)\s+(?:-|–|—)\s+(.+)$", human)
     if match:
         left = humanize(match.group(1))
@@ -3247,16 +3242,38 @@ def parse_filename(
         if current_title and fold(current_title) == fold(right):
             return left, right
 
-        # If one side is a known artist, split_by_known_artist above already
-        # handled it. Otherwise do not guess the orientation.
+        known = {fold(value): value for value in artists}
+        left_known = known.get(fold(left))
+        right_known = known.get(fold(right))
+
+        if left_known and not right_known:
+            return humanize(left_known), right
+        if right_known and not left_known:
+            return humanize(right_known), left
+
+        # Ambiguous: preserve the complete filename as fallback title. The
+        # online resolver will test both orientations using title/artist/duration.
         return "", ""
 
-    # HAPPY_KITTY_DRUGS_Подхалигалипаратруппермство
+    by_known = split_by_known_artist(raw, artists)
+    if by_known:
+        return by_known
+
+    match = re.match(r"^(.+?)\s+by\s+(.+)$", human, flags=re.IGNORECASE)
+    if match:
+        title = humanize(match.group(1))
+        artist = humanize(match.group(2))
+        if artist and title:
+            return artist, title
+
+    comma = split_comma_collaboration(raw)
+    if comma:
+        return comma
+
     mixed = split_script_transition(raw)
     if mixed:
         return mixed
 
-    # 6-HAPPY-KITTY-DRUGS-Yellow-Submarin-X9HVL6
     stylized = split_uppercase_artist_prefix(raw)
     if stylized:
         return stylized
@@ -4718,8 +4735,10 @@ PYMUSICCLOUDALBUM
 from __future__ import annotations
 
 import re
+import socket
 import sys
 import time
+import urllib3.util.connection as urllib3_connection
 import unicodedata
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -4727,6 +4746,10 @@ from typing import Any
 
 import requests
 from mutagen import File as MutagenFile
+
+# Force requests/urllib3 to IPv4. Several VPS images expose an unusable
+# IPv6 route, which otherwise produces [Errno 101] Network is unreachable.
+urllib3_connection.allowed_gai_family = lambda: socket.AF_INET
 from mediafile import (
     Image,
     ImageType,
@@ -4751,8 +4774,8 @@ CAA_BASE = "https://coverartarchive.org"
 ITUNES_URL = "https://itunes.apple.com/search"
 USER_AGENT = "MusicCloud/5.6.0 (https://github.com/hase9awa/music-cloud)"
 REQUEST_INTERVAL = 1.10
-REQUEST_TIMEOUT = 10
-MAX_FAILURES = 3
+REQUEST_TIMEOUT = 7
+MAX_FAILURES = 2
 MIN_MARGIN = 0.08
 
 http = requests.Session()
@@ -5358,10 +5381,12 @@ def valid_image_bytes(content: bytes) -> bool:
 def download_image(url: str) -> bytes | None:
     if not url:
         return None
+    if url.startswith("http://"):
+        url = "https://" + url[len("http://"):]
     try:
         response = http.get(
             url,
-            timeout=8,
+            timeout=6,
             allow_redirects=True,
             headers={
                 "User-Agent": USER_AGENT,
@@ -5385,7 +5410,7 @@ def caa_front_url(kind: str, mbid: str) -> str:
     try:
         response = http.get(
             f"{CAA_BASE}/{kind}/{mbid}",
-            timeout=8,
+            timeout=6,
             headers={
                 "User-Agent": USER_AGENT,
                 "Accept": "application/json",
@@ -5484,7 +5509,7 @@ def itunes_cover_url(albumartist: str, album: str) -> str:
                 "media": "music",
                 "limit": 50,
             },
-            timeout=8,
+            timeout=6,
             headers={"User-Agent": USER_AGENT},
         )
         response.raise_for_status()
@@ -6248,6 +6273,7 @@ LOCK="/run/lock/${APP_NAME}-beets.lock"
 # A batch is deliberately small enough for low-cost VPS instances, while a
 # long-running service can drain many batches sequentially.
 BATCH_SIZE=25
+NETWORK_ALBUM_DISCOVERY=0
 STABLE_SECONDS=60
 SCAN_INTERVAL=10
 IDLE_EXIT_SECONDS=120
@@ -6384,9 +6410,9 @@ process_batch() {
     "\${PYTHON}" "\${ONLINE_ENRICH_SCRIPT}" \
         "\${batch}/albums" "\${batch}/singles" || true
 
-    echo "Шаг 3/3: поиск общих релизов среди всей смеси файлов..."
-    "\${PYTHON}" "\${ALBUM_ENRICH_SCRIPT}" \
-        "\${batch}/albums" "\${batch}/singles" || true
+    echo "Шаг 3/3: локальная подготовка к импорту (без повторного MusicBrainz crawl)..."
+    echo "Уверенно найденные album/release/art уже записаны на шаге 2."
+    echo "Остальные файлы сохраняют tags/filename без выдуманной метадаты."
 
     album_count="\$(count_audio_tree "\${batch}/albums")"
     single_count="\$(count_audio_tree "\${batch}/singles")"
