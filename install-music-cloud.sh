@@ -47,7 +47,7 @@ set -Eeuo pipefail
 # ==============================================================================
 
 APP_NAME="music-cloud"
-SCRIPT_VERSION="5.2.0-universal"
+SCRIPT_VERSION="5.2.2-universal"
 DATA_DIR="/srv/${APP_NAME}"
 STACK_DIR="/opt/${APP_NAME}"
 STATE_DIR="/etc/${APP_NAME}"
@@ -239,7 +239,7 @@ load_install_state() {
     . "${INSTALL_STATE_FILE}"
 
     case "${STATE_VERSION:-}" in
-        3|3.*|4|4.*|5.0-home-cf|5.0.1-home-cf|5.0.2-home-cf|5.1.0-universal|5.1.1-universal|5.1.2-universal|5.2.0-universal)
+        3|3.*|4|4.*|5.0-home-cf|5.0.1-home-cf|5.0.2-home-cf|5.1.0-universal|5.1.1-universal|5.1.2-universal|5.2.0-universal|5.2.1-universal|5.2.2-universal)
             ;;
         *)
             die "Неподдерживаемая версия файла состояния ${INSTALL_STATE_FILE}."
@@ -1331,6 +1331,7 @@ from __future__ import annotations
 
 import os
 import re
+import sqlite3
 import unicodedata
 from pathlib import Path
 
@@ -1422,36 +1423,203 @@ def _split_script_transition(stem: str) -> tuple[str, str] | None:
     return None
 
 
-def _parse_filename(stem: str) -> tuple[str, str]:
+
+def _normalized_tokens(value: str) -> list[str]:
+    value = unicodedata.normalize("NFKC", value)
+    value = re.sub(r"^[\s._-]*(?:(?:track|trk)\s*)?\d{1,4}[\s._-]+", "", value, flags=re.IGNORECASE)
+    value = re.sub(r"[\s._-]+", " ", value).strip()
+    return [token for token in value.split(" ") if token]
+
+
+def _drop_probable_source_id(tokens: list[str]) -> list[str]:
+    if len(tokens) < 2:
+        return tokens
+    tail = tokens[-1]
+    # Downloader/export IDs such as X9HVL6. Require digits and an all-uppercase
+    # alphanumeric token to avoid stripping ordinary title words.
+    if (
+        5 <= len(tail) <= 12
+        and re.fullmatch(r"[A-Z0-9]+", tail)
+        and any(ch.isdigit() for ch in tail)
+        and any(ch.isalpha() for ch in tail)
+    ):
+        return tokens[:-1]
+    return tokens
+
+
+_BATCH_ARTIST_CACHE: dict[str, list[str]] = {}
+
+
+def _batch_tag_artists(path: str, queue_root: str) -> list[str]:
+    if not queue_root:
+        return []
+    try:
+        rel = Path(path).resolve().relative_to(Path(queue_root).resolve())
+    except (ValueError, OSError):
+        return []
+    parts = rel.parts
+    if not parts or not parts[0].startswith("batch-"):
+        return []
+    batch_root = str((Path(queue_root).resolve() / parts[0]))
+    if batch_root in _BATCH_ARTIST_CACHE:
+        return _BATCH_ARTIST_CACHE[batch_root]
+
+    found: set[str] = set()
+    for candidate in Path(batch_root).rglob("*"):
+        if not candidate.is_file():
+            continue
+        try:
+            audio = MutagenFile(candidate, easy=True)
+        except Exception:
+            continue
+        if audio is None or not getattr(audio, "tags", None):
+            continue
+        for key in ("artist", "albumartist"):
+            values = audio.tags.get(key, [])
+            if values:
+                value_ = _plain(values[0])
+                if value_ and not _missing(value_):
+                    found.add(value_)
+
+    result = sorted(found, key=lambda value_: len(_normalized_tokens(value_)), reverse=True)
+    _BATCH_ARTIST_CACHE[batch_root] = result
+    return result
+
+
+def _split_uppercase_artist_prefix(stem: str) -> tuple[str, str] | None:
+    tokens = _drop_probable_source_id(_normalized_tokens(stem))
+    if len(tokens) < 3:
+        return None
+
+    count = 0
+    for token in tokens:
+        letters = [ch for ch in token if ch.isalpha()]
+        if not letters:
+            break
+        if all(ch.isupper() for ch in letters):
+            count += 1
+            continue
+        break
+
+    # Require at least two stylized artist tokens and at least one title token.
+    if count >= 2 and count < len(tokens):
+        artist = _humanize(" ".join(tokens[:count]))
+        title = _humanize(" ".join(tokens[count:]))
+        if artist and title:
+            return artist, title
+    return None
+
+
+def _known_artists(library_db: str) -> list[str]:
+    if not library_db or not os.path.isfile(library_db):
+        return []
+    result: set[str] = set()
+    try:
+        con = sqlite3.connect(f"file:{library_db}?mode=ro", uri=True, timeout=2)
+        try:
+            for column in ("artist", "albumartist"):
+                for (value,) in con.execute(
+                    f"SELECT DISTINCT {column} FROM items "
+                    f"WHERE {column} IS NOT NULL AND trim({column}) <> ''"
+                ):
+                    text = _plain(value)
+                    if text and not _missing(text):
+                        result.add(text)
+        finally:
+            con.close()
+    except Exception:
+        return []
+    # Longest names first so HAPPY KITTY DRUGS wins over HAPPY, if both exist.
+    return sorted(result, key=lambda value: len(_normalized_tokens(value)), reverse=True)
+
+
+def _split_by_known_artist(stem: str, artists: list[str]) -> tuple[str, str] | None:
+    tokens = _normalized_tokens(stem)
+    if not tokens:
+        return None
+    tokens = _drop_probable_source_id(tokens)
+    folded = [token.casefold() for token in tokens]
+
+    for artist in artists:
+        artist_tokens = _normalized_tokens(artist)
+        if not artist_tokens or len(artist_tokens) >= len(tokens):
+            continue
+        af = [token.casefold() for token in artist_tokens]
+
+        # Artist at the start: ARTIST - Title / ARTIST_Title / 01-ARTIST-Title.
+        if folded[: len(af)] == af:
+            title_tokens = tokens[len(af) :]
+            if title_tokens:
+                return _humanize(artist), _humanize(" ".join(title_tokens))
+
+        # Artist at the end: Title - ARTIST.
+        if folded[-len(af) :] == af:
+            title_tokens = tokens[: -len(af)]
+            if title_tokens:
+                return _humanize(artist), _humanize(" ".join(title_tokens))
+    return None
+
+
+def _parse_filename(
+    stem: str,
+    current_artist: object = "",
+    current_title: object = "",
+    known_artists: list[str] | None = None,
+) -> tuple[str, str]:
     raw = _strip_track_prefix(stem)
     human = _humanize(raw)
 
-    # Strong, explicit separators first.
-    patterns = (
-        r"^(.+?)\s+(?:-|–|—)\s+(.+)$",
-        r"^(.+?)\s+by\s+(.+)$",
-    )
-    for pattern in patterns:
-        match = re.match(pattern, human, flags=re.IGNORECASE)
-        if not match:
-            continue
-        left = _humanize(match.group(1))
-        right = _humanize(match.group(2))
-        if not left or not right:
-            continue
-        if " by " in human.casefold():
-            # "Title by Artist"
-            return right, left
-        return left, right
+    # Existing library knowledge is the strongest filename-only signal. This
+    # handles both "Artist - Title" and "Title - Artist" and filenames where
+    # separators were converted between spaces, dashes, and underscores.
+    if known_artists:
+        known = _split_by_known_artist(raw, known_artists)
+        if known:
+            return known
 
-    # Double underscores are often deliberately used as an artist/title separator.
+    if not re.search(r"\s[-–—]\s", raw):
+        stylized = _split_uppercase_artist_prefix(raw)
+        if stylized:
+            return stylized
+
+    # Strong, explicit "Title by Artist" convention.
+    match = re.match(r"^(.+?)\s+by\s+(.+)$", human, flags=re.IGNORECASE)
+    if match:
+        title = _humanize(match.group(1))
+        artist = _humanize(match.group(2))
+        if artist and title:
+            return artist, title
+
+    # Double underscores are treated as an intentional Artist__Title separator.
     match = re.match(r"^(.+?)__+(.+)$", raw)
+    if match:
+        artist = _humanize(match.group(1))
+        title = _humanize(match.group(2))
+        if artist and title:
+            return artist, title
+
+    # A plain "A - B" filename is ambiguous. Use existing embedded tags when
+    # one side matches; otherwise preserve the whole stem rather than inventing
+    # the wrong artist/title orientation.
+    match = re.match(r"^(.+?)\s+(?:-|–|—)\s+(.+)$", human)
     if match:
         left = _humanize(match.group(1))
         right = _humanize(match.group(2))
-        if left and right:
-            return left, right
+        artist_fold = _fold(current_artist)
+        title_fold = _fold(current_title)
 
+        if artist_fold and artist_fold == _fold(left):
+            return left, right
+        if artist_fold and artist_fold == _fold(right):
+            return right, left
+        if title_fold and title_fold == _fold(left):
+            return right, left
+        if title_fold and title_fold == _fold(right):
+            return left, right
+        return "", ""
+
+    # Mixed-script splitting is useful when there is no explicit dash separator,
+    # for example HAPPY_KITTY_DRUGS_Подхалигалипаратруппермство.mp3.
     script_split = _split_script_transition(raw)
     if script_split:
         return script_split
@@ -1531,18 +1699,25 @@ def _directory_hints(
 class MusicCloudFilenamePlugin(plugins.BeetsPlugin):
     def __init__(self) -> None:
         super().__init__()
-        self.config.add({"upload_root": "", "queue_root": ""})
+        self.config.add({"upload_root": "", "queue_root": "", "library_db": ""})
         self.register_listener("import_task_start", self.filename_task)
 
     def filename_task(self, task, session) -> None:
         items = task.items if task.is_album else [task.item]
         upload_root = self.config["upload_root"].as_str()
         queue_root = self.config["queue_root"].as_str()
+        library_db = self.config["library_db"].as_str()
+        known_artists = _known_artists(library_db)
 
         for item in items:
             path = displayable_path(item.path)
             stem, _ = os.path.splitext(os.path.basename(path))
-            guessed_artist, guessed_title = _parse_filename(stem)
+            task_artists = list(dict.fromkeys(
+                known_artists + _batch_tag_artists(path, queue_root)
+            ))
+            guessed_artist, guessed_title = _parse_filename(
+                stem, item.artist, item.title, task_artists
+            )
             dir_artist, dir_album = _directory_hints(
                 path, upload_root, queue_root
             )
@@ -1582,8 +1757,8 @@ class MusicCloudFilenamePlugin(plugins.BeetsPlugin):
                 item.albumartist = item.artist
 
             # Absolute fallback: never let an untagged, unrecognized file become
-            # a blank-titled track. If no reliable split was found, preserve the
-            # original filename stem exactly as the title.
+            # a blank-titled track. Ambiguous names are kept verbatim instead of
+            # guessing the artist/title orientation.
             if title_missing:
                 item.title = stem
                 self._log.info("Title preserved from source filename: {.title}", item)
@@ -1602,7 +1777,6 @@ plugins:
   - musicbrainz
   - chroma
   - musiccloud_filename
-  - fromfilename
   - fetchart
   - embedart
   - lastgenre
@@ -1636,9 +1810,8 @@ paths:
 musiccloud_filename:
   upload_root: ${UPLOAD_DIR}
   queue_root: ${IMPORT_QUEUE_DIR}
+  library_db: ${BEETS_CONFIG_DIR}/library.db
 
-fromfilename:
-  auto: true
 
 chroma:
   auto: true
@@ -2312,6 +2485,7 @@ write_auto_import() {
 #!/opt/music-cloud/beets-venv/bin/python
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import sys
@@ -2491,6 +2665,130 @@ def remove_duplicate(loser: Any, winner: Any) -> None:
     loser.remove(delete=delete_file)
 
 
+
+def is_placeholder(value_: Any) -> bool:
+    text = norm(value_)
+    return text in {
+        "", "unknown", "unknown artist", "unknown album", "unknown title",
+        "untitled", "none", "n/a", "na", "00-00", "0", "singles",
+    }
+
+
+def metadata_quality(item: Any) -> tuple[int, int, int, int, float, int]:
+    artist_ok = int(not is_placeholder(value(item, "artist")))
+    title_ok = int(not is_placeholder(value(item, "title")))
+    album_ok = int(not is_placeholder(value(item, "album")))
+    mb_ok = int(bool(norm(value(item, "mb_trackid")) or norm(value(item, "mb_albumid"))))
+    try:
+        added = float(value(item, "added") or 0)
+    except (TypeError, ValueError):
+        added = 0.0
+    return (mb_ok, artist_ok + title_ok + album_ok, artist_ok, title_ok, added, as_int(value(item, "id")))
+
+
+def normalized_identity(item: Any) -> tuple[str, str]:
+    return (norm(value(item, "artist")), norm(value(item, "title")))
+
+
+def sha256_file(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def remove_group_duplicates(items: list[Any]) -> int:
+    if len(items) < 2:
+        return 0
+    winner = max(items, key=lambda item: (metadata_quality(item), rank_item(item)))
+    removed = 0
+    for loser in items:
+        if value(loser, "id") == value(winner, "id"):
+            continue
+        remove_duplicate(loser, winner)
+        removed += 1
+    return removed
+
+
+def deduplicate_same_paths(lib: Library) -> int:
+    groups: dict[str, list[Any]] = defaultdict(list)
+    for item in lib.items():
+        path = item_path(item)
+        if path:
+            groups[os.path.realpath(path)].append(item)
+    return sum(remove_group_duplicates(items) for items in groups.values() if len(items) > 1)
+
+
+def deduplicate_exact_files(lib: Library) -> int:
+    # Hash only equal-size candidates to keep the cost low even for large
+    # libraries. Exact byte equality is safe regardless of metadata keys.
+    size_groups: dict[int, list[Any]] = defaultdict(list)
+    for item in lib.items():
+        path = item_path(item)
+        if not path or not os.path.isfile(path):
+            continue
+        try:
+            size_groups[os.path.getsize(path)].append(item)
+        except OSError:
+            continue
+
+    removed = 0
+    for items in size_groups.values():
+        if len(items) < 2:
+            continue
+        hashes: dict[str, list[Any]] = defaultdict(list)
+        for item in items:
+            path = item_path(item)
+            try:
+                hashes[sha256_file(path)].append(item)
+            except OSError:
+                continue
+        for same in hashes.values():
+            if len(same) > 1:
+                removed += remove_group_duplicates(same)
+    return removed
+
+
+def deduplicate_fingerprints(lib: Library) -> int:
+    groups: dict[str, list[Any]] = defaultdict(list)
+    for item in lib.items():
+        fp = norm(value(item, "acoustid_fingerprint"))
+        if fp:
+            groups[fp].append(item)
+
+    removed = 0
+    for items in groups.values():
+        if len(items) < 2:
+            continue
+
+        identities = {normalized_identity(item) for item in items}
+        complete = [
+            item for item in items
+            if not is_placeholder(value(item, "artist"))
+            and not is_placeholder(value(item, "title"))
+        ]
+        incomplete = [item for item in items if item not in complete]
+
+        # Same acoustic fingerprint + same artist/title is a duplicate. If
+        # complete metadata conflicts, keep all releases; fingerprints alone do
+        # not justify deleting legitimate compilation/album copies.
+        nonempty_identities = {identity for identity in identities if all(identity)}
+        if len(nonempty_identities) <= 1:
+            removed += remove_group_duplicates(items)
+            continue
+
+        # When a good tagged copy and one or more Unknown/blank copies share the
+        # exact fingerprint, remove only the incomplete copies.
+        if complete and incomplete:
+            winner = max(complete, key=lambda item: (metadata_quality(item), rank_item(item)))
+            for loser in incomplete:
+                remove_duplicate(loser, winner)
+                removed += 1
+
+    return removed
+
+
 def deduplicate_tracks(lib: Library) -> int:
     groups: dict[tuple[Any, ...], list[Any]] = defaultdict(list)
     for item in lib.items():
@@ -2579,7 +2877,11 @@ def main() -> int:
     Path(MUSIC_DIR).mkdir(parents=True, exist_ok=True)
     lib = Library(DB_PATH, MUSIC_DIR)
 
-    removed = deduplicate_tracks(lib)
+    removed = 0
+    removed += deduplicate_same_paths(lib)
+    removed += deduplicate_exact_files(lib)
+    removed += deduplicate_fingerprints(lib)
+    removed += deduplicate_tracks(lib)
     album_changes = consolidate_albums(lib)
 
     print(f"MUSIC_CLOUD_REMOVED={removed}")
@@ -2603,12 +2905,15 @@ PYDEDUPE
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import sys
 import time
 import uuid
 from collections import defaultdict
 from pathlib import Path
+
+from mutagen import File as MutagenFile
 
 
 AUDIO_EXTENSIONS = {
@@ -2622,6 +2927,10 @@ ART_NAMES = {
 }
 MAX_ALBUM_GROUP = 120
 RECHECK_SECONDS = 3
+GENERIC_DIR_NAMES = {
+    "audio", "incoming", "music", "songs", "tracks", "upload", "uploads",
+    "download", "downloads", "new", "misc", "various",
+}
 
 
 def is_audio(path: Path) -> bool:
@@ -2665,6 +2974,73 @@ def stable_audio(upload: Path, stable_seconds: int) -> list[Path]:
     return result
 
 
+def _tag_values(path: Path) -> dict[str, str]:
+    try:
+        audio = MutagenFile(path, easy=True)
+    except Exception:
+        return {}
+    if audio is None or not getattr(audio, "tags", None):
+        return {}
+
+    result: dict[str, str] = {}
+    for key in ("album", "albumartist", "artist", "tracknumber"):
+        values = audio.tags.get(key, [])
+        if values:
+            value = str(values[0]).strip()
+            if value:
+                result[key] = value
+    return result
+
+
+def _norm_tag(value: str) -> str:
+    return re.sub(r"\s+", " ", value.casefold()).strip()
+
+
+def _looks_like_numbered_track(path: Path) -> bool:
+    return bool(re.match(r"^(?:track\s*)?\d{1,3}[ ._-]+", path.stem, re.IGNORECASE))
+
+
+def _confident_album_directory(upload: Path, parent: Path, files: list[Path]) -> bool:
+    if len(files) < 2 or len(files) > MAX_ALBUM_GROUP:
+        return False
+
+    # A generic collection folder must never become one giant "Unknown Album".
+    if parent.name.casefold().strip() in GENERIC_DIR_NAMES:
+        generic = True
+    else:
+        generic = False
+
+    tagged: list[dict[str, str]] = [_tag_values(path) for path in files]
+    album_values = [_norm_tag(t["album"]) for t in tagged if t.get("album")]
+
+    if album_values:
+        counts: dict[str, int] = defaultdict(int)
+        for value in album_values:
+            counts[value] += 1
+        dominant = max(counts.values())
+        coverage = len(album_values) / len(files)
+        agreement = dominant / len(album_values)
+        # Strong evidence from embedded tags beats the directory name.
+        if coverage >= 0.70 and agreement >= 0.85:
+            return True
+
+    if generic:
+        return False
+
+    # Untagged album-folder fallback: require Artist/Album/file depth and track
+    # numbers on most files. A single arbitrary folder is not enough evidence.
+    try:
+        rel = parent.relative_to(upload)
+        depth = len(rel.parts)
+    except ValueError:
+        depth = 0
+    numbered = sum(1 for path in files if _looks_like_numbered_track(path))
+    if depth >= 2 and numbered / len(files) >= 0.70:
+        return True
+
+    return False
+
+
 def choose_files(
     upload: Path,
     stable: list[Path],
@@ -2674,10 +3050,8 @@ def choose_files(
     stable_set = set(stable)
     groups: dict[Path, list[Path]] = defaultdict(list)
 
-    all_audio: list[Path] = []
     for path in upload.rglob("*"):
         if is_audio(path):
-            all_audio.append(path)
             groups[path.parent].append(path)
 
     selected_albums: list[Path] = []
@@ -2686,35 +3060,27 @@ def choose_files(
     remaining = limit
     cutoff = time.time() - stable_seconds
 
-    # Completed leaf directories of sensible album size are preserved as album
-    # groups. This prevents a 20-track album from being split across batches.
     album_candidates: list[tuple[float, Path, list[Path]]] = []
     for parent, files in groups.items():
-        if parent == upload:
-            continue
-        if len(files) > MAX_ALBUM_GROUP:
+        if parent == upload or len(files) > MAX_ALBUM_GROUP:
             continue
         if not all(path in stable_set for path in files):
             continue
         try:
-            # If new files were recently created in the directory, wait before
-            # treating the directory as complete.
             if parent.stat().st_mtime > cutoff:
                 continue
             oldest = min(path.stat().st_mtime for path in files)
         except OSError:
+            continue
+        if not _confident_album_directory(upload, parent, files):
             continue
         album_candidates.append((oldest, parent, sorted(files)))
 
     album_candidates.sort(key=lambda row: row[0])
 
     for _, parent, files in album_candidates:
-        if not files:
-            continue
         if len(files) > remaining and selected_albums:
             continue
-        # A single normal-sized album may exceed the remaining capacity; keep
-        # it intact rather than splitting it.
         selected_albums.extend(files)
         selected_album_dirs.add(parent)
         remaining = max(0, limit - len(selected_albums) - len(selected_singles))
@@ -2722,20 +3088,10 @@ def choose_files(
             break
 
     if remaining > 0:
-        # Root-level files and abnormally huge directories are handled as
-        # singletons. This is critical for flat uploads containing thousands of
-        # unrelated tracks: beets must not see them as one enormous album.
-        singles: list[Path] = []
-        for path in stable:
-            if path in selected_albums:
-                continue
-            if path.parent == upload:
-                singles.append(path)
-                continue
-            parent_group = groups.get(path.parent, [])
-            if len(parent_group) > MAX_ALBUM_GROUP:
-                singles.append(path)
-
+        # Everything not proven to be an album is imported as singletons. This
+        # is deliberately conservative: preserving a filename is better than
+        # manufacturing an Unknown Album with track numbers 0/0.
+        singles = [path for path in stable if path not in selected_albums]
         singles.sort(key=lambda p: p.stat().st_mtime if p.exists() else 0)
         selected_singles.extend(singles[:remaining])
 
@@ -2963,7 +3319,9 @@ run_dedupe() {
 
 process_batch() {
     local batch="\$1"
-    local album_count single_count album_status=0 single_status=0 dedupe_status=0
+    local album_count single_count album_status=0 single_status=0
+    local album_fallback_status=0 single_fallback_status=0 dedupe_status=0
+    local remaining_albums remaining_singles remaining
 
     album_count="\$(count_audio_tree "\${batch}/albums")"
     single_count="\$(count_audio_tree "\${batch}/singles")"
@@ -2972,6 +3330,8 @@ process_batch() {
     echo "  альбомных треков: \${album_count}"
     echo "  одиночных треков: \${single_count}"
 
+    # Stage 1: normal beets autotagging. This uses MusicBrainz/AcoustID and all
+    # configured metadata plugins.
     if (( album_count > 0 )); then
         set +e
         "\${BEET}" import -q "\${batch}/albums"
@@ -2986,20 +3346,58 @@ process_batch() {
         set -e
     fi
 
+    remaining_albums="\$(count_audio_tree "\${batch}/albums")"
+    remaining_singles="\$(count_audio_tree "\${batch}/singles")"
+
+    # Stage 2: if MusicBrainz is unavailable, a remote plugin fails, or some
+    # tracks simply cannot be matched, do not block thousands of queued files.
+    # -A disables autotagging (and therefore MusicBrainz lookup).
+    # --plugins=musiccloud_filename disables network-dependent import plugins
+    # for this fallback pass and keeps only the local filename metadata helper.
+    #
+    # Existing embedded tags are preserved. For completely untagged files the
+    # helper derives high-confidence fields from the filename/folders; when a
+    # name is ambiguous it preserves the exact source filename stem as title.
+    if (( remaining_albums > 0 )); then
+        echo "Осталось \${remaining_albums} альбомных треков после online-поиска."
+        echo "Fallback: импорт без MusicBrainz с локальными тегами/именем файла."
+        set +e
+        "\${BEET}" --plugins=musiccloud_filename import -q -A "\${batch}/albums"
+        album_fallback_status=\$?
+        set -e
+    fi
+
+    if (( remaining_singles > 0 )); then
+        echo "Осталось \${remaining_singles} одиночных треков после online-поиска."
+        echo "Fallback: импорт без MusicBrainz с локальными тегами/именем файла."
+        set +e
+        "\${BEET}" --plugins=musiccloud_filename import -q -A -s "\${batch}/singles"
+        single_fallback_status=\$?
+        set -e
+    fi
+
     run_dedupe || dedupe_status=\$?
 
-    remaining="\$(( \$(count_audio_tree "\${batch}/albums") + \$(count_audio_tree "\${batch}/singles") ))"
-    echo "Коды beets: albums=\${album_status}, singles=\${single_status}; dedupe=\${dedupe_status}"
+    remaining_albums="\$(count_audio_tree "\${batch}/albums")"
+    remaining_singles="\$(count_audio_tree "\${batch}/singles")"
+    remaining=\$(( remaining_albums + remaining_singles ))
+
+    echo "Коды beets online: albums=\${album_status}, singles=\${single_status}"
+    echo "Коды fallback: albums=\${album_fallback_status}, singles=\${single_fallback_status}; dedupe=\${dedupe_status}"
     echo "Осталось аудиофайлов в пакете: \${remaining}"
 
     restore_leftovers "\${batch}"
 
-    if (( album_status != 0 || single_status != 0 || dedupe_status != 0 )); then
-        echo "Пакет завершён с ошибкой; оставшиеся файлы возвращены в upload и будут повторены позже."
+    if (( remaining > 0 || album_fallback_status != 0 || single_fallback_status != 0 || dedupe_status != 0 )); then
+        echo "Пакет завершён не полностью; оставшиеся файлы возвращены в upload для повторной попытки."
         return 1
     fi
 
-    echo "Пакет импортирован успешно."
+    if (( album_status != 0 || single_status != 0 )); then
+        echo "Online-распознавание было недоступно/неполно, но fallback успешно импортировал оставшиеся файлы."
+    else
+        echo "Пакет импортирован успешно."
+    fi
     return 0
 }
 
@@ -3026,7 +3424,7 @@ fi
 
         if [[ -z "\${batch}" ]]; then
             set +e
-            stage_output="\$("\${BATCHER}" "\${UPLOAD}" "\${QUEUE}" "\${BATCH_SIZE}" "\${STABLE_SECONDS}" 2>&1)"
+            stage_output="\$("\${PYTHON}" "\${BATCHER}" "\${UPLOAD}" "\${QUEUE}" "\${BATCH_SIZE}" "\${STABLE_SECONDS}" 2>&1)"
             stage_status=\$?
             set -e
             printf '%s\n' "\${stage_output}"
@@ -3036,7 +3434,7 @@ fi
                 exit "\${stage_status}"
             fi
 
-            batch="\$(awk -F= '/^BATCH_PATH=/{print substr(\$0, index(\$0, \"=\") + 1)}' <<<"\${stage_output}" | tail -n 1)"
+            batch="\$(printf '%s\n' "\${stage_output}" | sed -n 's/^BATCH_PATH=//p' | tail -n 1)"
         fi
 
         if [[ -z "\${batch}" || ! -d "\${batch}" ]]; then
@@ -4440,6 +4838,8 @@ repair_import_automation() {
     write_beets_update_timer
     save_install_state
 
+    # Clean duplicate database/file entries created by earlier importer versions.
+    run_as_owner "${DEDUPE_SCRIPT}" || warn "Не удалось полностью очистить старые дубли; импорт продолжится."
     systemctl start "${AUTO_IMPORT_SERVICE}" || true
 
     ok "Механизм импорта восстановлен."
