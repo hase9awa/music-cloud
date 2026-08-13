@@ -47,7 +47,7 @@ set -Eeuo pipefail
 # ==============================================================================
 
 APP_NAME="music-cloud"
-SCRIPT_VERSION="5.2.2-universal"
+SCRIPT_VERSION="5.2.3-universal"
 DATA_DIR="/srv/${APP_NAME}"
 STACK_DIR="/opt/${APP_NAME}"
 STATE_DIR="/etc/${APP_NAME}"
@@ -85,6 +85,7 @@ CREDENTIALS_FILE="/root/${APP_NAME}-credentials.txt"
 
 AUTO_IMPORT_SCRIPT="/usr/local/bin/${APP_NAME}-auto-import"
 IMPORT_BATCH_SCRIPT="/usr/local/bin/${APP_NAME}-stage-import-batch"
+METADATA_PREFLIGHT_SCRIPT="/usr/local/bin/${APP_NAME}-metadata-preflight"
 DEDUPE_SCRIPT="/usr/local/bin/${APP_NAME}-dedupe"
 BEETS_WRAPPER="/usr/local/bin/${APP_NAME}-beet"
 BEETS_UPDATE_SCRIPT="/usr/local/bin/${APP_NAME}-beets-update"
@@ -239,7 +240,7 @@ load_install_state() {
     . "${INSTALL_STATE_FILE}"
 
     case "${STATE_VERSION:-}" in
-        3|3.*|4|4.*|5.0-home-cf|5.0.1-home-cf|5.0.2-home-cf|5.1.0-universal|5.1.1-universal|5.1.2-universal|5.2.0-universal|5.2.1-universal|5.2.2-universal)
+        3|3.*|4|4.*|5.0-home-cf|5.0.1-home-cf|5.0.2-home-cf|5.1.0-universal|5.1.1-universal|5.1.2-universal|5.2.0-universal|5.2.1-universal|5.2.2-universal|5.2.3-universal)
             ;;
         *)
             die "Неподдерживаемая версия файла состояния ${INSTALL_STATE_FILE}."
@@ -1335,6 +1336,8 @@ import sqlite3
 import unicodedata
 from pathlib import Path
 
+from mutagen import File as MutagenFile
+
 from beets import plugins
 from beets.util import displayable_path
 
@@ -1793,7 +1796,7 @@ import:
   incremental: false
   timid: false
   quiet: true
-  quiet_fallback: asis
+  quiet_fallback: skip
   # Новая копия импортируется, затем обработчик оставляет её и удаляет
   # старую запись/файл по точному ключу трека.
   duplicate_action: keep
@@ -2494,6 +2497,8 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
+from mutagen import File as MutagenFile
+
 from beets.library import Library
 
 DB_PATH = "${BEETS_CONFIG_DIR}/library.db"
@@ -2622,13 +2627,14 @@ def rank_item(item: Any) -> tuple[int, float, float, int]:
     return (exists, added, mtime, as_int(value(item, "id")))
 
 
-def rank_album(album: Any) -> tuple[int, float, int]:
+def rank_album(album: Any) -> tuple[int, int, float, int]:
     count = sum(1 for _ in album.items())
+    art_ok = album_art_score(album)
     try:
         added = float(value(album, "added") or 0)
     except (TypeError, ValueError):
         added = 0.0
-    return (count, added, as_int(value(album, "id")))
+    return (art_ok, count, added, as_int(value(album, "id")))
 
 
 def same_file(a: str, b: str) -> bool:
@@ -2674,16 +2680,77 @@ def is_placeholder(value_: Any) -> bool:
     }
 
 
-def metadata_quality(item: Any) -> tuple[int, int, int, int, float, int]:
+
+def embedded_art_score(path: str) -> int:
+    if not path or not os.path.isfile(path):
+        return 0
+    try:
+        audio = MutagenFile(path)
+    except Exception:
+        return 0
+    if audio is None:
+        return 0
+
+    pictures = getattr(audio, "pictures", None)
+    if pictures:
+        return 1
+
+    tags = getattr(audio, "tags", None)
+    if not tags:
+        return 0
+
+    try:
+        keys = [str(key).casefold() for key in tags.keys()]
+    except Exception:
+        keys = []
+
+    if any(
+        key.startswith("apic")
+        or key in {"covr", "metadata_block_picture", "coverart"}
+        for key in keys
+    ):
+        return 1
+
+    try:
+        for frame in tags.values():
+            if frame.__class__.__name__.casefold().startswith("apic"):
+                return 1
+    except Exception:
+        pass
+
+    return 0
+
+
+def album_art_score(album: Any) -> int:
+    raw = value(album, "artpath")
+    if not raw:
+        return 0
+    try:
+        path = os.fsdecode(raw)
+    except Exception:
+        path = str(raw)
+    return int(bool(path) and os.path.isfile(path))
+
+
+def metadata_quality(item: Any) -> tuple[int, int, int, int, int, float, int]:
     artist_ok = int(not is_placeholder(value(item, "artist")))
     title_ok = int(not is_placeholder(value(item, "title")))
     album_ok = int(not is_placeholder(value(item, "album")))
     mb_ok = int(bool(norm(value(item, "mb_trackid")) or norm(value(item, "mb_albumid"))))
+    art_ok = embedded_art_score(item_path(item))
     try:
         added = float(value(item, "added") or 0)
     except (TypeError, ValueError):
         added = 0.0
-    return (mb_ok, artist_ok + title_ok + album_ok, artist_ok, title_ok, added, as_int(value(item, "id")))
+    return (
+        mb_ok,
+        art_ok,
+        artist_ok + title_ok + album_ok,
+        artist_ok,
+        title_ok,
+        added,
+        as_int(value(item, "id")),
+    )
 
 
 def normalized_identity(item: Any) -> tuple[str, str]:
@@ -2800,8 +2867,12 @@ def deduplicate_tracks(lib: Library) -> int:
     for items in groups.values():
         if len(items) < 2:
             continue
-        winner = max(items, key=rank_item)
-        for loser in sorted(items, key=rank_item, reverse=True):
+        winner = max(items, key=lambda item: (metadata_quality(item), rank_item(item)))
+        for loser in sorted(
+            items,
+            key=lambda item: (metadata_quality(item), rank_item(item)),
+            reverse=True,
+        ):
             if value(loser, "id") == value(winner, "id"):
                 continue
             remove_duplicate(loser, winner)
@@ -2899,6 +2970,442 @@ PYDEDUPE
 
     chmod 0755 "${DEDUPE_SCRIPT}"
     "${BEETS_VENV}/bin/python" -m py_compile "${DEDUPE_SCRIPT}"
+
+
+    cat > "${METADATA_PREFLIGHT_SCRIPT}" <<'PYMUSICCLOUDPREFLIGHT'
+#!/opt/music-cloud/beets-venv/bin/python
+from __future__ import annotations
+
+import os
+import re
+import sqlite3
+import sys
+import unicodedata
+from pathlib import Path
+from typing import Iterable
+
+from mutagen import File as MutagenFile
+
+
+AUDIO_EXTENSIONS = {
+    ".mp3", ".flac", ".m4a", ".mp4", ".ogg", ".opus", ".wav", ".wave",
+    ".aif", ".aiff", ".alac", ".wma", ".ape", ".mpc", ".tta", ".dsf", ".dff",
+}
+
+PLACEHOLDERS = {
+    "",
+    "unknown",
+    "unknown artist",
+    "unknown title",
+    "unknown track",
+    "untitled",
+    "none",
+    "n/a",
+    "na",
+    "<unknown>",
+    "(unknown)",
+    "singles",
+    "singles.1",
+    "00-00",
+    "0",
+}
+
+
+def plain(value: object) -> str:
+    if isinstance(value, (list, tuple)):
+        value = value[0] if value else ""
+    return str(value or "").strip()
+
+
+def fold(value: object) -> str:
+    text = unicodedata.normalize("NFKC", plain(value)).casefold()
+    text = re.sub(r"[_\s]+", " ", text)
+    return text.strip(" .,_-–—()[]{}")
+
+
+def missing(value: object) -> bool:
+    return fold(value) in PLACEHOLDERS
+
+
+def humanize(value: str) -> str:
+    value = unicodedata.normalize("NFKC", value)
+    value = re.sub(r"[_\s]+", " ", value)
+    value = re.sub(r"\s*,\s*", ", ", value)
+    return value.strip(" ._-–—")
+
+
+def normalized_tokens(value: str) -> list[str]:
+    value = unicodedata.normalize("NFKC", value)
+    value = re.sub(
+        r"^[\s._-]*(?:(?:track|trk)\s*)?\d{1,4}[\s._-]+",
+        "",
+        value,
+        flags=re.IGNORECASE,
+    )
+    value = re.sub(r"[\s._-]+", " ", value).strip()
+    return [token for token in value.split(" ") if token]
+
+
+def strip_track_prefix(value: str) -> str:
+    # Handles 01 -, 01_, 6-HAPPY..., track 01 ..., etc.
+    return re.sub(
+        r"^[\s._-]*(?:(?:track|trk)\s*)?\d{1,4}[\s._-]+",
+        "",
+        value,
+        flags=re.IGNORECASE,
+    ).strip()
+
+
+def drop_probable_source_id(tokens: list[str]) -> list[str]:
+    if len(tokens) < 2:
+        return tokens
+    tail = tokens[-1]
+    if (
+        5 <= len(tail) <= 12
+        and re.fullmatch(r"[A-Z0-9]+", tail)
+        and any(ch.isdigit() for ch in tail)
+        and any(ch.isalpha() for ch in tail)
+    ):
+        return tokens[:-1]
+    return tokens
+
+
+def script_kind(token: str) -> str:
+    latin = 0
+    cyrillic = 0
+    for char in token:
+        if not char.isalpha():
+            continue
+        try:
+            name = unicodedata.name(char)
+        except ValueError:
+            continue
+        if "CYRILLIC" in name:
+            cyrillic += 1
+        elif "LATIN" in name:
+            latin += 1
+    if latin and not cyrillic:
+        return "latin"
+    if cyrillic and not latin:
+        return "cyrillic"
+    return ""
+
+
+def split_script_transition(stem: str) -> tuple[str, str] | None:
+    tokens = [token for token in re.split(r"[_\s]+", stem) if token]
+    if len(tokens) < 2:
+        return None
+
+    kinds = [script_kind(token) for token in tokens]
+    for index in range(1, len(tokens)):
+        left_kind = next((k for k in reversed(kinds[:index]) if k), "")
+        right_kind = next((k for k in kinds[index:] if k), "")
+        if left_kind and right_kind and left_kind != right_kind:
+            artist = humanize(" ".join(tokens[:index]))
+            title = humanize(" ".join(tokens[index:]))
+            if artist and title:
+                return artist, title
+    return None
+
+
+def split_uppercase_artist_prefix(stem: str) -> tuple[str, str] | None:
+    tokens = drop_probable_source_id(normalized_tokens(stem))
+    if len(tokens) < 3:
+        return None
+
+    count = 0
+    for token in tokens:
+        letters = [ch for ch in token if ch.isalpha()]
+        if not letters:
+            break
+        if all(ch.isupper() for ch in letters):
+            count += 1
+        else:
+            break
+
+    if count >= 2 and count < len(tokens):
+        artist = humanize(" ".join(tokens[:count]))
+        title = humanize(" ".join(tokens[count:]))
+        if artist and title:
+            return artist, title
+    return None
+
+
+def known_artists(library_db: str) -> list[str]:
+    if not library_db or not os.path.isfile(library_db):
+        return []
+
+    result: set[str] = set()
+    try:
+        con = sqlite3.connect(f"file:{library_db}?mode=ro", uri=True, timeout=2)
+        try:
+            for column in ("artist", "albumartist"):
+                for (value,) in con.execute(
+                    f"SELECT DISTINCT {column} FROM items "
+                    f"WHERE {column} IS NOT NULL AND trim({column}) <> ''"
+                ):
+                    text = plain(value)
+                    if text and not missing(text):
+                        result.add(text)
+        finally:
+            con.close()
+    except Exception:
+        return []
+
+    return sorted(
+        result,
+        key=lambda value: len(normalized_tokens(value)),
+        reverse=True,
+    )
+
+
+def split_by_known_artist(stem: str, artists: Iterable[str]) -> tuple[str, str] | None:
+    tokens = drop_probable_source_id(normalized_tokens(stem))
+    folded = [token.casefold() for token in tokens]
+
+    for artist in artists:
+        artist_tokens = normalized_tokens(artist)
+        if not artist_tokens or len(artist_tokens) >= len(tokens):
+            continue
+        af = [token.casefold() for token in artist_tokens]
+
+        if folded[: len(af)] == af:
+            title_tokens = tokens[len(af):]
+            if title_tokens:
+                return humanize(artist), humanize(" ".join(title_tokens))
+
+        if folded[-len(af):] == af:
+            title_tokens = tokens[:-len(af)]
+            if title_tokens:
+                return humanize(artist), humanize(" ".join(title_tokens))
+    return None
+
+
+def split_comma_collaboration(stem: str) -> tuple[str, str] | None:
+    # Common downloader name:
+    # Овсянкин,_Бифидогосток_Бабушкин_кампот
+    #
+    # The comma is strong evidence that the first two name groups are artists.
+    # We intentionally require a comma and at least two remaining title words so
+    # that ordinary one-artist names with commas are not over-parsed.
+    raw = strip_track_prefix(stem)
+    text = re.sub(r"[_\s]+", " ", raw).strip()
+    match = re.match(r"^([^,]{2,80}),\s*([^\s,]{2,80})\s+(.+\s+.+)$", text)
+    if not match:
+        return None
+
+    artist1 = humanize(match.group(1))
+    artist2 = humanize(match.group(2))
+    title = humanize(match.group(3))
+    if artist1 and artist2 and title:
+        return f"{artist1}, {artist2}", title
+    return None
+
+
+def parse_filename(
+    stem: str,
+    current_artist: str,
+    current_title: str,
+    artists: list[str],
+) -> tuple[str, str]:
+    raw = strip_track_prefix(stem)
+    human = humanize(raw)
+
+    by_known = split_by_known_artist(raw, artists)
+    if by_known:
+        return by_known
+
+    # Title by Artist.
+    match = re.match(r"^(.+?)\s+by\s+(.+)$", human, flags=re.IGNORECASE)
+    if match:
+        title = humanize(match.group(1))
+        artist = humanize(match.group(2))
+        if artist and title:
+            return artist, title
+
+    # Artist__Title.
+    match = re.match(r"^(.+?)__+(.+)$", raw)
+    if match:
+        artist = humanize(match.group(1))
+        title = humanize(match.group(2))
+        if artist and title:
+            return artist, title
+
+    comma = split_comma_collaboration(raw)
+    if comma:
+        return comma
+
+    # Explicit spaced dash is ambiguous without corroborating tags.
+    match = re.match(r"^(.+?)\s+(?:-|–|—)\s+(.+)$", human)
+    if match:
+        left = humanize(match.group(1))
+        right = humanize(match.group(2))
+
+        if current_artist and fold(current_artist) == fold(left):
+            return left, right
+        if current_artist and fold(current_artist) == fold(right):
+            return right, left
+        if current_title and fold(current_title) == fold(left):
+            return right, left
+        if current_title and fold(current_title) == fold(right):
+            return left, right
+
+        # If one side is a known artist, split_by_known_artist above already
+        # handled it. Otherwise do not guess the orientation.
+        return "", ""
+
+    # HAPPY_KITTY_DRUGS_Подхалигалипаратруппермство
+    mixed = split_script_transition(raw)
+    if mixed:
+        return mixed
+
+    # 6-HAPPY-KITTY-DRUGS-Yellow-Submarin-X9HVL6
+    stylized = split_uppercase_artist_prefix(raw)
+    if stylized:
+        return stylized
+
+    return "", ""
+
+
+def tag_values(audio) -> tuple[str, str]:
+    if audio is None or not getattr(audio, "tags", None):
+        return "", ""
+
+    def first(key: str) -> str:
+        try:
+            values = audio.tags.get(key, [])
+        except Exception:
+            return ""
+        return plain(values)
+
+    return first("artist"), first("title")
+
+
+def ensure_tags(audio) -> bool:
+    if audio is None:
+        return False
+    if getattr(audio, "tags", None) is not None:
+        return True
+    try:
+        audio.add_tags()
+        return True
+    except Exception:
+        return False
+
+
+def set_easy_tag(audio, key: str, value: str) -> bool:
+    try:
+        audio.tags[key] = [value]
+        return True
+    except Exception:
+        try:
+            audio[key] = value
+            return True
+        except Exception:
+            return False
+
+
+def process(path: Path, artists: list[str]) -> tuple[bool, str]:
+    try:
+        audio = MutagenFile(path, easy=True)
+    except Exception as exc:
+        return False, f"cannot read tags: {exc}"
+
+    if audio is None:
+        return False, "unsupported/unknown audio format"
+
+    current_artist, current_title = tag_values(audio)
+    stem = path.stem
+
+    guessed_artist, guessed_title = parse_filename(
+        stem,
+        current_artist,
+        current_title,
+        artists,
+    )
+
+    need_artist = missing(current_artist)
+    need_title = missing(current_title)
+
+    # The source filename is the final invariant: even if no online service can
+    # identify the recording, the title must never collapse to "Singles.1",
+    # 00-00, or another path-derived placeholder.
+    fallback_title = stem
+
+    changes: list[str] = []
+    if need_artist and guessed_artist:
+        changes.append(f"artist={guessed_artist!r}")
+    if need_title:
+        changes.append(f"title={(guessed_title or fallback_title)!r}")
+
+    if not changes:
+        return False, "metadata already useful"
+
+    if not ensure_tags(audio):
+        return False, "cannot create tag container"
+
+    changed = False
+    if need_artist and guessed_artist:
+        changed |= set_easy_tag(audio, "artist", guessed_artist)
+
+    if need_title:
+        changed |= set_easy_tag(audio, "title", guessed_title or fallback_title)
+
+    if not changed:
+        return False, "format does not support writable artist/title tags"
+
+    # Mutagen updates selected tags in-place and leaves unrelated tag frames
+    # (including embedded artwork) untouched.
+    try:
+        audio.save()
+    except Exception as exc:
+        return False, f"cannot save tags: {exc}"
+
+    return True, ", ".join(changes)
+
+
+def main() -> int:
+    if len(sys.argv) < 3:
+        print(
+            "usage: music-cloud-metadata-preflight LIBRARY_DB PATH...",
+            file=sys.stderr,
+        )
+        return 2
+
+    library_db = sys.argv[1]
+    roots = [Path(value) for value in sys.argv[2:]]
+    artists = known_artists(library_db)
+
+    changed = 0
+    errors = 0
+
+    for root in roots:
+        if not root.exists():
+            continue
+        candidates = [root] if root.is_file() else root.rglob("*")
+        for path in candidates:
+            if not path.is_file() or path.suffix.casefold() not in AUDIO_EXTENSIONS:
+                continue
+            ok, message = process(path, artists)
+            if ok:
+                changed += 1
+                print(f"PREFLIGHT: {path.name}: {message}")
+            elif not message.startswith("metadata already"):
+                errors += 1
+                print(f"PREFLIGHT-WARN: {path}: {message}")
+
+    print(f"PREFLIGHT_CHANGED={changed}")
+    print(f"PREFLIGHT_WARNINGS={errors}")
+    # Tag-write failures should not block import of otherwise valid files.
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+PYMUSICCLOUDPREFLIGHT
+
+    chmod 0755 "${METADATA_PREFLIGHT_SCRIPT}"
+    "${BEETS_VENV}/bin/python" -m py_compile "${METADATA_PREFLIGHT_SCRIPT}"
 
     cat > "${IMPORT_BATCH_SCRIPT}" <<'PYMUSICCLOUDBATCH'
 #!/usr/bin/env python3
@@ -3330,6 +3837,10 @@ process_batch() {
     echo "  альбомных треков: \${album_count}"
     echo "  одиночных треков: \${single_count}"
 
+    echo "Предварительное восстановление метаданных из исходных имён файлов..."
+    "\${PYTHON}" "${METADATA_PREFLIGHT_SCRIPT}" "${BEETS_CONFIG_DIR}/library.db" \
+        "\${batch}/albums" "\${batch}/singles" || true
+
     # Stage 1: normal beets autotagging. This uses MusicBrainz/AcoustID and all
     # configured metadata plugins.
     if (( album_count > 0 )); then
@@ -3466,6 +3977,16 @@ fi
     pending="\$(count_upload_audio)"
     echo "Обработано пакетов за запуск: \${batches}"
     echo "Аудиофайлов осталось в upload: \${pending}"
+
+    # beets has a long-standing edge case where automatic fetchart during a
+    # quiet+move import can miss album artwork. Run the documented post-import
+    # fetch command once after a drain cycle, then embed any associated artwork.
+    # fetchart without --force skips albums that already have artwork.
+    if (( batches > 0 )); then
+        echo "Проверка отсутствующих обложек альбомов..."
+        "\${BEET}" fetchart -q || echo "fetchart: часть обложек не удалось получить"
+        "\${BEET}" embedart || echo "embedart: часть обложек не удалось встроить"
+    fi
 
     if (( batches >= MAX_BATCHES_PER_RUN && pending > 0 )); then
         echo "Достигнут лимит пакетов одного запуска; следующий timer продолжит очередь."
@@ -4780,6 +5301,7 @@ EOF
     rm -f \
         "${AUTO_IMPORT_SCRIPT}" \
         "${IMPORT_BATCH_SCRIPT}" \
+        "${METADATA_PREFLIGHT_SCRIPT}" \
         "${UPLOAD_WATCH_SCRIPT}" \
         "${LEGACY_AUTO_IMPORT_WATCH_SCRIPT}" \
         "${DEDUPE_SCRIPT}" \
