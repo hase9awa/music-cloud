@@ -47,7 +47,7 @@ set -Eeuo pipefail
 # ==============================================================================
 
 APP_NAME="music-cloud"
-SCRIPT_VERSION="5.6.5-universal"
+SCRIPT_VERSION="5.6.6-universal"
 DATA_DIR="/srv/${APP_NAME}"
 STACK_DIR="/opt/${APP_NAME}"
 STATE_DIR="/etc/${APP_NAME}"
@@ -242,7 +242,7 @@ load_install_state() {
     . "${INSTALL_STATE_FILE}"
 
     case "${STATE_VERSION:-}" in
-        3|3.*|4|4.*|5.0-home-cf|5.0.1-home-cf|5.0.2-home-cf|5.1.0-universal|5.1.1-universal|5.1.2-universal|5.2.0-universal|5.2.1-universal|5.2.2-universal|5.2.3-universal|5.3.0-universal|5.4.0-universal|5.5.0-universal|5.6.0-universal|5.6.1-universal|5.6.2-universal|5.6.3-universal|5.6.4-universal|5.6.5-universal)
+        3|3.*|4|4.*|5.0-home-cf|5.0.1-home-cf|5.0.2-home-cf|5.1.0-universal|5.1.1-universal|5.1.2-universal|5.2.0-universal|5.2.1-universal|5.2.2-universal|5.2.3-universal|5.3.0-universal|5.4.0-universal|5.5.0-universal|5.6.0-universal|5.6.1-universal|5.6.2-universal|5.6.3-universal|5.6.4-universal|5.6.5-universal|5.6.6-universal)
             ;;
         *)
             die "Неподдерживаемая версия файла состояния ${INSTALL_STATE_FILE}."
@@ -4777,6 +4777,7 @@ REQUEST_INTERVAL = 1.10
 REQUEST_TIMEOUT = 7
 MAX_FAILURES = 2
 MIN_MARGIN = 0.08
+MIN_ORIENTATION_MARGIN = 0.10
 
 http = requests.Session()
 http.headers.update({
@@ -5182,15 +5183,104 @@ def best_match(
     title: str,
     duration: float,
 ) -> tuple[dict[str, Any], float, str, str, str] | None:
-    all_ranked: list[tuple[float, dict[str, Any], str, str, str]] = []
+    sources = source_candidates(path, artist, title)
 
-    for source_artist, source_title, reason in source_candidates(
-        path, artist, title
-    ):
-        local_ranked: list[
+    # A filename "A - B" is semantically ambiguous:
+    #   A = title, B = artist
+    #   A = artist, B = title
+    #
+    # Evaluate BOTH orientations before deciding. The order in the filename
+    # must never bias the result.
+    orientation_sources = [
+        source for source in sources
+        if source[2].startswith("filename:")
+    ]
+
+    if len(orientation_sources) >= 2:
+        orientation_best: list[
             tuple[float, dict[str, Any], str, str, str]
         ] = []
 
+        for source_artist, source_title, reason in orientation_sources:
+            ranked: list[
+                tuple[float, dict[str, Any], str, str, str]
+            ] = []
+
+            for row in search_recordings(source_title, source_artist):
+                score, metrics = row_score(
+                    source_artist,
+                    source_title,
+                    duration,
+                    row,
+                )
+                if not safe_match(
+                    source_artist,
+                    source_title,
+                    reason,
+                    score,
+                    metrics,
+                ):
+                    continue
+                ranked.append(
+                    (score, row, source_artist, source_title, reason)
+                )
+
+            ranked.sort(key=lambda item: item[0], reverse=True)
+            if ranked:
+                orientation_best.append(ranked[0])
+
+        orientation_best.sort(key=lambda item: item[0], reverse=True)
+
+        if len(orientation_best) == 1:
+            best = orientation_best[0]
+            print(
+                "FILENAME-ORIENTATION: "
+                f"{path.name!r} -> artist={best[2]!r}, "
+                f"title={best[3]!r}; "
+                f"score={best[0]:.3f}; only confident orientation",
+                flush=True,
+            )
+            return best[1], best[0], best[2], best[3], best[4]
+
+        if len(orientation_best) >= 2:
+            best = orientation_best[0]
+            second = orientation_best[1]
+            margin = best[0] - second[0]
+
+            if margin < MIN_ORIENTATION_MARGIN:
+                print(
+                    "FILENAME-AMBIGUOUS: "
+                    f"{path.name!r}; "
+                    f"best={best[0]:.3f} "
+                    f"({best[2]!r} — {best[3]!r}), "
+                    f"second={second[0]:.3f} "
+                    f"({second[2]!r} — {second[3]!r}); "
+                    "keeping original filename",
+                    flush=True,
+                )
+                return None
+
+            print(
+                "FILENAME-ORIENTATION: "
+                f"{path.name!r} -> artist={best[2]!r}, "
+                f"title={best[3]!r}; "
+                f"score={best[0]:.3f}; margin={margin:.3f}",
+                flush=True,
+            )
+            return best[1], best[0], best[2], best[3], best[4]
+
+        print(
+            f"FILENAME-AMBIGUOUS: {path.name!r}; "
+            "neither orientation has a confident match",
+            flush=True,
+        )
+        return None
+
+    ranked_all: list[
+        tuple[float, dict[str, Any], str, str, str]
+    ] = []
+
+    for source_artist, source_title, reason in sources:
         for row in search_recordings(source_title, source_artist):
             score, metrics = row_score(
                 source_artist,
@@ -5206,36 +5296,19 @@ def best_match(
                 metrics,
             ):
                 continue
-            local_ranked.append(
+            ranked_all.append(
                 (score, row, source_artist, source_title, reason)
             )
 
-        local_ranked.sort(key=lambda item: item[0], reverse=True)
-        if local_ranked:
-            best = local_ranked[0]
-            # A very strong orientation can be accepted immediately. The
-            # alternative filename orientation is only queried when needed.
-            if best[0] >= 0.90:
-                if len(local_ranked) == 1:
-                    return best[1], best[0], best[2], best[3], best[4]
-                best_id = plain(best[1].get("id"))
-                second_id = plain(local_ranked[1][1].get("id"))
-                if (
-                    (best_id and best_id == second_id)
-                    or best[0] - local_ranked[1][0] >= MIN_MARGIN
-                ):
-                    return best[1], best[0], best[2], best[3], best[4]
-
-            all_ranked.extend(local_ranked)
-
-    if not all_ranked:
+    if not ranked_all:
         return None
 
-    all_ranked.sort(key=lambda item: item[0], reverse=True)
-    best = all_ranked[0]
-    if len(all_ranked) > 1 and best[0] - all_ranked[1][0] < MIN_MARGIN:
+    ranked_all.sort(key=lambda item: item[0], reverse=True)
+    best = ranked_all[0]
+
+    if len(ranked_all) > 1 and best[0] - ranked_all[1][0] < MIN_MARGIN:
         best_id = plain(best[1].get("id"))
-        second_id = plain(all_ranked[1][1].get("id"))
+        second_id = plain(ranked_all[1][1].get("id"))
         if not best_id or best_id != second_id:
             return None
 
@@ -6274,6 +6347,7 @@ LOCK="/run/lock/${APP_NAME}-beets.lock"
 # long-running service can drain many batches sequentially.
 BATCH_SIZE=25
 NETWORK_ALBUM_DISCOVERY=0
+FILENAME_DASH_ORIENTATION=compare-both
 STABLE_SECONDS=60
 SCAN_INTERVAL=10
 IDLE_EXIT_SECONDS=120
