@@ -47,7 +47,7 @@ set -Eeuo pipefail
 # ==============================================================================
 
 APP_NAME="music-cloud"
-SCRIPT_VERSION="5.6.8-universal"
+SCRIPT_VERSION="5.6.9-universal"
 DATA_DIR="/srv/${APP_NAME}"
 STACK_DIR="/opt/${APP_NAME}"
 STATE_DIR="/etc/${APP_NAME}"
@@ -242,7 +242,7 @@ load_install_state() {
     . "${INSTALL_STATE_FILE}"
 
     case "${STATE_VERSION:-}" in
-        3|3.*|4|4.*|5.0-home-cf|5.0.1-home-cf|5.0.2-home-cf|5.1.0-universal|5.1.1-universal|5.1.2-universal|5.2.0-universal|5.2.1-universal|5.2.2-universal|5.2.3-universal|5.3.0-universal|5.4.0-universal|5.5.0-universal|5.6.0-universal|5.6.1-universal|5.6.2-universal|5.6.3-universal|5.6.4-universal|5.6.5-universal|5.6.6-universal|5.6.7-universal|5.6.8-universal)
+        3|3.*|4|4.*|5.0-home-cf|5.0.1-home-cf|5.0.2-home-cf|5.1.0-universal|5.1.1-universal|5.1.2-universal|5.2.0-universal|5.2.1-universal|5.2.2-universal|5.2.3-universal|5.3.0-universal|5.4.0-universal|5.5.0-universal|5.6.0-universal|5.6.1-universal|5.6.2-universal|5.6.3-universal|5.6.4-universal|5.6.5-universal|5.6.6-universal|5.6.7-universal|5.6.8-universal|5.6.9-universal)
             ;;
         *)
             die "Неподдерживаемая версия файла состояния ${INSTALL_STATE_FILE}."
@@ -1804,13 +1804,15 @@ import:
   duplicate_action: keep
   log: ${BEETS_CONFIG_DIR}/import.log
 
+per_disc_numbering: false
+
 match:
   strong_rec_thresh: 0.04
 
 paths:
-  default: \$albumartist/\$album%aunique{}/\$disc-\$track \$title
+  default: \$albumartist/\$album%aunique{}/\$track \$title
   singleton: Singles/\$artist/\$title
-  comp: Compilations/\$album%aunique{}/\$disc-\$track \$title
+  comp: Compilations/\$album%aunique{}/\$track \$title
 
 musiccloud_filename:
   upload_root: ${UPLOAD_DIR}
@@ -2500,6 +2502,7 @@ from pathlib import Path
 from typing import Any
 
 from mutagen import File as MutagenFile
+from mediafile import MediaFile, UnreadableFileError
 
 from beets.library import Library
 
@@ -2576,11 +2579,12 @@ def album_key(album: Any) -> tuple[Any, ...] | None:
 def track_key(item: Any) -> tuple[Any, ...] | None:
     mb_albumid = norm(value(item, "mb_albumid"))
     mb_trackid = norm(value(item, "mb_trackid"))
-    disc = as_int(value(item, "disc"))
     track = as_int(value(item, "track"))
 
+    # Disc is intentionally ignored. Music Cloud flattens every album into one
+    # logical track list and does not expose medium/disc numbers.
     if mb_albumid and mb_trackid:
-        return ("mb_track", mb_albumid, mb_trackid, disc, track)
+        return ("mb_track", mb_albumid, mb_trackid, track)
 
     artist = norm(value(item, "artist"))
     albumartist = norm(value(item, "albumartist")) or artist
@@ -2595,7 +2599,6 @@ def track_key(item: Any) -> tuple[Any, ...] | None:
             "metadata_track",
             albumartist,
             album,
-            disc,
             track,
             artist,
             title,
@@ -2917,6 +2920,67 @@ def logical_item_key(item: Any) -> tuple[Any, ...] | None:
     return ("logical_album", albumartist, album)
 
 
+def clear_physical_disc_tags(path: str) -> bool:
+    if not path or not os.path.isfile(path):
+        return False
+    try:
+        media = MediaFile(path)
+        media.disc = None
+        media.disctotal = None
+        media.save()
+        return True
+    except (UnreadableFileError, OSError, ValueError):
+        return False
+    except Exception:
+        return False
+
+
+def flatten_track_numbers_if_needed(items: list[Any]) -> int:
+    """Flatten only when disc-based numbering actually duplicates track nums."""
+    positive_tracks = [
+        as_int(value(item, "track"))
+        for item in items
+        if as_int(value(item, "track")) > 0
+    ]
+    if not positive_tracks:
+        return 0
+
+    # Already globally numbered (like 1..15 split incorrectly between Disc 0/1):
+    # preserve the original track numbers exactly.
+    if len(set(positive_tracks)) == len(positive_tracks):
+        return 0
+
+    ordered = sorted(
+        items,
+        key=lambda item: (
+            as_int(value(item, "disc")) if as_int(value(item, "disc")) > 0 else 1,
+            as_int(value(item, "track")) if as_int(value(item, "track")) > 0 else 10**9,
+            as_int(value(item, "id")),
+        ),
+    )
+
+    changes = 0
+    for number, item in enumerate(ordered, start=1):
+        dirty = False
+        if as_int(value(item, "track")) != number:
+            item["track"] = number
+            dirty = True
+        if as_int(value(item, "tracktotal")) != len(ordered):
+            item["tracktotal"] = len(ordered)
+            dirty = True
+
+        if dirty:
+            item.store()
+            item.try_write()
+            changes += 1
+
+    if changes:
+        print(
+            f"ALBUM: flattened multidisc numbering to 1..{len(ordered)}"
+        )
+    return changes
+
+
 def normalize_album_group(
     items: list[Any],
     album: Any,
@@ -2961,6 +3025,8 @@ def normalize_album_group(
             + ", ".join(sorted(album_ids))
         )
 
+    changes += flatten_track_numbers_if_needed(items)
+
     for item in items:
         dirty = False
 
@@ -2970,6 +3036,9 @@ def normalize_album_group(
             "mb_albumid": canonical_mb_albumid,
             "mb_releasegroupid": canonical_releasegroupid,
             "albumdisambig": canonical_disambig,
+            "disc": 0,
+            "disctotal": 0,
+            "disctitle": "",
         }
         if canonical_year:
             wanted["year"] = canonical_year
@@ -3004,6 +3073,21 @@ def normalize_album_group(
     # Synchronize physical paths using the album path format. This moves old
     # /Singles/... files to /AlbumArtist/Album/... and moves album art too.
     album.try_sync(write=True, move=True, inherit=False)
+
+    # beets stores disc fields as integers in the DB. Zero is fine internally,
+    # but some players render an explicit zero as "Disc 0". Therefore remove
+    # the actual media tags after the final beets write/move.
+    cleared = 0
+    for item in album.items():
+        path = item_path(item)
+        if clear_physical_disc_tags(path):
+            cleared += 1
+
+    if cleared:
+        print(
+            f"ALBUM: removed physical disc/disctotal tags from "
+            f"{cleared} tracks"
+        )
 
     return changes
 
@@ -3115,8 +3199,30 @@ def main() -> int:
     removed += deduplicate_tracks(lib)
     album_changes = consolidate_albums(lib)
 
+    disc_db_changes = 0
+    disc_file_changes = 0
+    for item in list(lib.items()):
+        dirty = False
+        if as_int(value(item, "disc")) != 0:
+            item["disc"] = 0
+            dirty = True
+        if as_int(value(item, "disctotal")) != 0:
+            item["disctotal"] = 0
+            dirty = True
+        if str(value(item, "disctitle") or ""):
+            item["disctitle"] = ""
+            dirty = True
+        if dirty:
+            item.store()
+            disc_db_changes += 1
+
+        if clear_physical_disc_tags(item_path(item)):
+            disc_file_changes += 1
+
     print(f"MUSIC_CLOUD_REMOVED={removed}")
     print(f"MUSIC_CLOUD_ALBUM_CHANGES={album_changes}")
+    print(f"MUSIC_CLOUD_DISC_DB_CLEARED={disc_db_changes}")
+    print(f"MUSIC_CLOUD_DISC_FILE_TAGS_CLEARED={disc_file_changes}")
     return 0
 
 
@@ -3145,6 +3251,7 @@ from pathlib import Path
 from typing import Iterable
 
 from mutagen import File as MutagenFile
+from mediafile import MediaFile, UnreadableFileError
 
 
 AUDIO_EXTENSIONS = {
@@ -3477,14 +3584,43 @@ def set_easy_tag(audio, key: str, value: str) -> bool:
             return False
 
 
+def strip_disc_tags(path: Path) -> bool:
+    """Remove disc/disctotal from the actual media file."""
+    try:
+        media = MediaFile(str(path))
+    except (UnreadableFileError, OSError, ValueError):
+        return False
+    except Exception:
+        return False
+
+    had_disc = bool(media.disc or media.disctotal)
+    try:
+        media.disc = None
+        media.disctotal = None
+        media.save()
+    except Exception:
+        return False
+
+    return had_disc
+
+
 def process(path: Path, artists: list[str]) -> tuple[bool, str]:
+    disc_removed = strip_disc_tags(path)
+
     try:
         audio = MutagenFile(path, easy=True)
     except Exception as exc:
-        return False, f"cannot read tags: {exc}"
+        return disc_removed, (
+            "disc metadata removed; cannot read other tags: "
+            f"{exc}"
+        ) if disc_removed else f"cannot read tags: {exc}"
 
     if audio is None:
-        return False, "unsupported/unknown audio format"
+        return disc_removed, (
+            "disc metadata removed; unsupported/unknown audio format"
+            if disc_removed
+            else "unsupported/unknown audio format"
+        )
 
     current_artist, current_title = tag_values(audio)
     stem = path.stem
@@ -3511,6 +3647,8 @@ def process(path: Path, artists: list[str]) -> tuple[bool, str]:
         changes.append(f"title={(guessed_title or fallback_title)!r}")
 
     if not changes:
+        if disc_removed:
+            return True, "disc/disctotal removed; metadata already useful"
         return False, "metadata already useful"
 
     if not ensure_tags(audio):
@@ -3533,6 +3671,8 @@ def process(path: Path, artists: list[str]) -> tuple[bool, str]:
     except Exception as exc:
         return False, f"cannot save tags: {exc}"
 
+    if disc_removed:
+        changes.append("disc/disctotal removed")
     return True, ", ".join(changes)
 
 
@@ -4630,7 +4770,6 @@ def apply_cluster(
             ("albumartist", albumartist),
             ("date", year),
             ("tracknumber", str(remote["number"])),
-            ("discnumber", str(remote["disc"])),
             ("musicbrainz_trackid", remote["recording_id"]),
             ("musicbrainz_albumid", release_id),
             ("musicbrainz_releasegroupid", release_group_id),
@@ -5893,7 +6032,6 @@ def process(path: Path) -> tuple[bool, str]:
     current_albumartist = get_tag(audio, "albumartist")
     current_date = get_tag(audio, "date")
     current_track = get_tag(audio, "tracknumber")
-    current_disc = get_tag(audio, "discnumber")
     current_genre = get_tag(audio, "genre")
     current_mbid = get_tag(audio, "musicbrainz_trackid")
     current_release_mbid = get_tag(audio, "musicbrainz_albumid")
@@ -6006,7 +6144,6 @@ def process(path: Path) -> tuple[bool, str]:
     albumartist = ""
     date = ""
     track_number = ""
-    disc_number = ""
     track_title = ""
     genre = ""
 
@@ -6014,7 +6151,7 @@ def process(path: Path) -> tuple[bool, str]:
         album = plain(detail.get("title"))
         albumartist = artist_credit(detail.get("artist-credit"))
         date = plain(detail.get("date"))
-        track_number, disc_number, track_title = find_track(
+        track_number, _discard_disc_number, track_title = find_track(
             detail, recording_id
         )
         genre = collect_genres(detail)
@@ -6064,7 +6201,6 @@ def process(path: Path) -> tuple[bool, str]:
             date[:4] if re.match(r"^\d{4}", date) else date,
         ),
         ("tracknumber", current_track, track_number),
-        ("discnumber", current_disc, disc_number),
         ("genre", current_genre, genre),
         ("musicbrainz_trackid", current_mbid, recording_id),
         ("musicbrainz_albumid", current_release_mbid, release_id),
@@ -6578,6 +6714,7 @@ FILENAME_DASH_ORIENTATION=compare-both
 ALBUM_FOLDER_ATOMIC=1
 TRUST_COMPLETE_ALBUM_TAGS=1
 REPAIR_SINGLETON_ALBUMS=1
+DISABLE_DISC_METADATA=1
 STABLE_SECONDS=60
 SCAN_INTERVAL=10
 IDLE_EXIT_SECONDS=120
