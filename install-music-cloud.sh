@@ -47,7 +47,7 @@ set -Eeuo pipefail
 # ==============================================================================
 
 APP_NAME="music-cloud"
-SCRIPT_VERSION="5.6.7-universal"
+SCRIPT_VERSION="5.6.8-universal"
 DATA_DIR="/srv/${APP_NAME}"
 STACK_DIR="/opt/${APP_NAME}"
 STATE_DIR="/etc/${APP_NAME}"
@@ -242,7 +242,7 @@ load_install_state() {
     . "${INSTALL_STATE_FILE}"
 
     case "${STATE_VERSION:-}" in
-        3|3.*|4|4.*|5.0-home-cf|5.0.1-home-cf|5.0.2-home-cf|5.1.0-universal|5.1.1-universal|5.1.2-universal|5.2.0-universal|5.2.1-universal|5.2.2-universal|5.2.3-universal|5.3.0-universal|5.4.0-universal|5.5.0-universal|5.6.0-universal|5.6.1-universal|5.6.2-universal|5.6.3-universal|5.6.4-universal|5.6.5-universal|5.6.6-universal|5.6.7-universal)
+        3|3.*|4|4.*|5.0-home-cf|5.0.1-home-cf|5.0.2-home-cf|5.1.0-universal|5.1.1-universal|5.1.2-universal|5.2.0-universal|5.2.1-universal|5.2.2-universal|5.2.3-universal|5.3.0-universal|5.4.0-universal|5.5.0-universal|5.6.0-universal|5.6.1-universal|5.6.2-universal|5.6.3-universal|5.6.4-universal|5.6.5-universal|5.6.6-universal|5.6.7-universal|5.6.8-universal)
             ;;
         *)
             die "Неподдерживаемая версия файла состояния ${INSTALL_STATE_FILE}."
@@ -2495,7 +2495,7 @@ import os
 import re
 import sys
 import unicodedata
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
 
@@ -2871,30 +2871,210 @@ def deduplicate_tracks(lib: Library) -> int:
     return removed
 
 
+def most_common_text(items: list[Any], key: str) -> str:
+    values: list[str] = []
+    for item in items:
+        raw = str(value(item, key) or "").strip()
+        if raw and not is_placeholder(raw):
+            values.append(raw)
+    if not values:
+        return ""
+
+    counts = Counter(norm(raw) for raw in values)
+    winner_norm, _ = counts.most_common(1)[0]
+
+    # Prefer the most frequent original spelling/case inside the winning
+    # normalized value.
+    originals = [raw for raw in values if norm(raw) == winner_norm]
+    return Counter(originals).most_common(1)[0][0]
+
+
+def unique_nonempty(items: list[Any], key: str) -> list[str]:
+    result: dict[str, str] = {}
+    for item in items:
+        raw = str(value(item, key) or "").strip()
+        if not raw:
+            continue
+        result.setdefault(norm(raw), raw)
+    return list(result.values())
+
+
+def logical_item_key(item: Any) -> tuple[Any, ...] | None:
+    albumartist = (
+        norm(value(item, "albumartist"))
+        or norm(value(item, "artist"))
+    )
+    album = norm(value(item, "album"))
+
+    if (
+        not albumartist
+        or not album
+        or is_placeholder(albumartist)
+        or is_placeholder(album)
+    ):
+        return None
+
+    return ("logical_album", albumartist, album)
+
+
+def normalize_album_group(
+    items: list[Any],
+    album: Any,
+) -> int:
+    """Normalize DB + embedded file tags for one logical album."""
+    changes = 0
+
+    canonical_album = most_common_text(items, "album")
+    canonical_albumartist = (
+        most_common_text(items, "albumartist")
+        or most_common_text(items, "artist")
+    )
+
+    years = sorted(
+        {
+            as_int(value(item, "year"))
+            for item in items
+            if as_int(value(item, "year")) > 0
+        }
+    )
+    # If there are multiple real years, do not invent a single edition year.
+    canonical_year = years[0] if len(years) == 1 else 0
+
+    album_ids = unique_nonempty(items, "mb_albumid")
+    release_group_ids = unique_nonempty(items, "mb_releasegroupid")
+    disambigs = unique_nonempty(items, "albumdisambig")
+
+    # Multiple Release IDs are exactly what makes Navidrome split one logical
+    # album after per-track enrichment. When they conflict, clear the Release
+    # ID for the logical album instead of choosing a random edition.
+    canonical_mb_albumid = album_ids[0] if len(album_ids) == 1 else ""
+    canonical_releasegroupid = (
+        release_group_ids[0]
+        if len(release_group_ids) == 1
+        else ""
+    )
+    canonical_disambig = disambigs[0] if len(disambigs) == 1 else ""
+
+    if len(album_ids) > 1:
+        print(
+            "ALBUM: conflicting MusicBrainz release IDs; clearing them: "
+            + ", ".join(sorted(album_ids))
+        )
+
+    for item in items:
+        dirty = False
+
+        wanted = {
+            "album": canonical_album,
+            "albumartist": canonical_albumartist,
+            "mb_albumid": canonical_mb_albumid,
+            "mb_releasegroupid": canonical_releasegroupid,
+            "albumdisambig": canonical_disambig,
+        }
+        if canonical_year:
+            wanted["year"] = canonical_year
+
+        for field, new_value in wanted.items():
+            current = value(item, field)
+            if str(current or "") == str(new_value or ""):
+                continue
+            item[field] = new_value
+            dirty = True
+
+        if value(item, "album_id") != value(album, "id"):
+            item.album_id = album.id
+            dirty = True
+
+        if dirty:
+            item.store()
+            # Persist the corrected Album / Album Artist / MB release tags into
+            # the actual MP3/FLAC file so Navidrome sees the same logical album.
+            item.try_write()
+            changes += 1
+
+    album["album"] = canonical_album
+    album["albumartist"] = canonical_albumartist
+    album["mb_albumid"] = canonical_mb_albumid
+    album["mb_releasegroupid"] = canonical_releasegroupid
+    album["albumdisambig"] = canonical_disambig
+    if canonical_year:
+        album["year"] = canonical_year
+    album.store(inherit=False)
+
+    # Synchronize physical paths using the album path format. This moves old
+    # /Singles/... files to /AlbumArtist/Album/... and moves album art too.
+    album.try_sync(write=True, move=True, inherit=False)
+
+    return changes
+
+
 def consolidate_albums(lib: Library) -> int:
-    groups: dict[tuple[Any, ...], list[Any]] = defaultdict(list)
-    for album in lib.albums():
-        key = album_key(album)
+    # Build logical album groups from ITEMS, not only Album rows. This is the
+    # key fix for libraries where an entire real album was imported with -s.
+    item_groups: dict[tuple[Any, ...], list[Any]] = defaultdict(list)
+    for item in list(lib.items()):
+        key = logical_item_key(item)
         if key is not None:
-            groups[key].append(album)
+            item_groups[key].append(item)
 
     changes = 0
-    canonical: dict[tuple[Any, ...], Any] = {}
 
-    for key, albums in groups.items():
-        winner = max(albums, key=rank_album)
-        canonical[key] = winner
-        if len(albums) < 2:
+    for key, items in item_groups.items():
+        if len(items) < 2:
+            # One true single with an Album tag should remain a singleton.
             continue
 
-        for old_album in albums:
+        # Avoid accidentally merging genuinely different same-name releases
+        # when the items contain more than one explicit non-zero year.
+        years = {
+            as_int(value(item, "year"))
+            for item in items
+            if as_int(value(item, "year")) > 0
+        }
+        if len(years) > 1:
+            print(
+                "ALBUM-SKIP: same artist/title but conflicting years "
+                f"{sorted(years)} for key={key!r}"
+            )
+            continue
+
+        existing: dict[int, Any] = {}
+        for item in items:
+            album_id = as_int(value(item, "album_id"))
+            if not album_id or album_id in existing:
+                continue
+            album = lib.get_album(album_id)
+            if album is not None:
+                existing[album_id] = album
+
+        if existing:
+            winner = max(existing.values(), key=rank_album)
+        else:
+            # All tracks are beets singletons. Create the missing Album row.
+            winner = lib.add_album(items)
+            changes += 1
+            print(
+                "ALBUM: created album id={} from {} singleton tracks: "
+                "{} — {}".format(
+                    value(winner, "id"),
+                    len(items),
+                    most_common_text(items, "albumartist")
+                    or most_common_text(items, "artist"),
+                    most_common_text(items, "album"),
+                )
+            )
+
+        # Merge any other Album rows for this same logical album.
+        for old_album in list(existing.values()):
             if value(old_album, "id") == value(winner, "id"):
                 continue
+
             moved = 0
             for item in list(old_album.items()):
                 item.album_id = winner.id
                 item.store()
                 moved += 1
+
             old_id = value(old_album, "id")
             old_album.remove(delete=False, with_items=False)
             changes += 1
@@ -2904,23 +3084,11 @@ def consolidate_albums(lib: Library) -> int:
                 )
             )
 
-    for item in list(lib.items()):
-        if value(item, "album_id"):
-            continue
-        key = album_key_from_item(item, strict=True)
-        target = canonical.get(key) if key is not None else None
-        if target is None:
-            continue
-        item.album_id = target.id
-        item.store()
-        changes += 1
-        print(
-            "ALBUM: attached singleton id={} to album id={} "
-            "(will be moved to album path)".format(
-                value(item, "id"), value(target, "id")
-            )
-        )
+        # Attach all remaining singleton items and normalize the tags embedded
+        # in files. This is what makes Navidrome collapse its duplicate albums.
+        changes += normalize_album_group(items, winner)
 
+    # Remove empty stale Album rows after consolidation.
     for album in list(lib.albums()):
         if any(True for _ in album.items()):
             continue
@@ -6409,6 +6577,7 @@ NETWORK_ALBUM_DISCOVERY=0
 FILENAME_DASH_ORIENTATION=compare-both
 ALBUM_FOLDER_ATOMIC=1
 TRUST_COMPLETE_ALBUM_TAGS=1
+REPAIR_SINGLETON_ALBUMS=1
 STABLE_SECONDS=60
 SCAN_INTERVAL=10
 IDLE_EXIT_SECONDS=120
