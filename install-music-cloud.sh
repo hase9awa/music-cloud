@@ -47,7 +47,7 @@ set -Eeuo pipefail
 # ==============================================================================
 
 APP_NAME="music-cloud"
-SCRIPT_VERSION="5.7.0-universal"
+SCRIPT_VERSION="5.7.2-universal"
 DATA_DIR="/srv/${APP_NAME}"
 STACK_DIR="/opt/${APP_NAME}"
 STATE_DIR="/etc/${APP_NAME}"
@@ -242,7 +242,7 @@ load_install_state() {
     . "${INSTALL_STATE_FILE}"
 
     case "${STATE_VERSION:-}" in
-        3|3.*|4|4.*|5.0-home-cf|5.0.1-home-cf|5.0.2-home-cf|5.1.0-universal|5.1.1-universal|5.1.2-universal|5.2.0-universal|5.2.1-universal|5.2.2-universal|5.2.3-universal|5.3.0-universal|5.4.0-universal|5.5.0-universal|5.6.0-universal|5.6.1-universal|5.6.2-universal|5.6.3-universal|5.6.4-universal|5.6.5-universal|5.6.6-universal|5.6.7-universal|5.6.8-universal|5.6.9-universal|5.7.0-universal)
+        3|3.*|4|4.*|5.0-home-cf|5.0.1-home-cf|5.0.2-home-cf|5.1.0-universal|5.1.1-universal|5.1.2-universal|5.2.0-universal|5.2.1-universal|5.2.2-universal|5.2.3-universal|5.3.0-universal|5.4.0-universal|5.5.0-universal|5.6.0-universal|5.6.1-universal|5.6.2-universal|5.6.3-universal|5.6.4-universal|5.6.5-universal|5.6.6-universal|5.6.7-universal|5.6.8-universal|5.6.9-universal|5.7.0-universal|5.7.1-universal|5.7.2-universal)
             ;;
         *)
             die "Неподдерживаемая версия файла состояния ${INSTALL_STATE_FILE}."
@@ -1824,7 +1824,9 @@ chroma:
   auto: true
 
 fetchart:
-  auto: true
+  # Existing covers are immutable during automatic import. Artwork for new
+  # files is resolved before beets sees them.
+  auto: false
   cautious: true
   minwidth: 500
   cover_names:
@@ -1837,7 +1839,9 @@ fetchart:
     - itunes
 
 embedart:
-  auto: true
+  # Never run a global automatic embed pass: it can rewrite covers on albums
+  # that were already correct.
+  auto: false
 
 lastgenre:
   auto: true
@@ -2517,6 +2521,138 @@ def norm(value: Any) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+TEXT_FIELDS_TO_REPAIR = (
+    "artist",
+    "title",
+    "album",
+    "albumartist",
+    "genre",
+    "composer",
+)
+
+
+def cyrillic_letters(value_: str) -> int:
+    count = 0
+    for char in value_:
+        if not char.isalpha():
+            continue
+        try:
+            if "CYRILLIC" in unicodedata.name(char):
+                count += 1
+        except ValueError:
+            pass
+    return count
+
+
+def alphabetic_letters(value_: str) -> int:
+    return sum(1 for char in value_ if char.isalpha())
+
+
+def latin1_high_chars(value_: str) -> int:
+    return sum(1 for char in value_ if 0x00C0 <= ord(char) <= 0x00FF)
+
+
+def repair_cp1251_mojibake(value_: Any) -> tuple[str, bool]:
+    text = str(value_ or "")
+    if not text:
+        return text, False
+
+    try:
+        candidate = text.encode("latin-1").decode("cp1251")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        return text, False
+
+    if candidate == text:
+        return text, False
+
+    letters = alphabetic_letters(candidate)
+    cyr = cyrillic_letters(candidate)
+    high = latin1_high_chars(text)
+
+    if letters < 2 or cyr < 2:
+        return text, False
+    if cyr / max(1, letters) < 0.55:
+        return text, False
+    if high / max(1, alphabetic_letters(text)) < 0.45:
+        return text, False
+    if "\ufffd" in candidate:
+        return text, False
+    if any(ord(char) < 32 and char not in "\t\r\n" for char in candidate):
+        return text, False
+
+    return candidate, True
+
+
+def write_repaired_text_fields(path: str, changes: dict[str, str]) -> bool:
+    if not path or not os.path.isfile(path) or not changes:
+        return False
+
+    try:
+        audio = MutagenFile(path, easy=True)
+    except Exception:
+        return False
+    if audio is None:
+        return False
+
+    if getattr(audio, "tags", None) is None:
+        try:
+            audio.add_tags()
+        except Exception:
+            return False
+
+    wrote = False
+    for field, new_value in changes.items():
+        try:
+            audio.tags[field] = [new_value]
+            wrote = True
+        except Exception:
+            continue
+
+    if not wrote:
+        return False
+
+    try:
+        # Mutagen preserves unrelated frames such as APIC/embedded artwork.
+        audio.save()
+        return True
+    except Exception:
+        return False
+
+
+def repair_library_text_encoding(lib: Library) -> tuple[int, int]:
+    db_changes = 0
+    file_changes = 0
+
+    for item in list(lib.items()):
+        repaired: dict[str, str] = {}
+
+        for field in TEXT_FIELDS_TO_REPAIR:
+            current = value(item, field)
+            fixed, changed = repair_cp1251_mojibake(current)
+            if not changed:
+                continue
+            item[field] = fixed
+            repaired[field] = fixed
+
+        if not repaired:
+            continue
+
+        item.store()
+        db_changes += 1
+
+        if write_repaired_text_fields(item_path(item), repaired):
+            file_changes += 1
+
+        print(
+            "ENCODING: repaired item id={} fields={}".format(
+                value(item, "id"),
+                ",".join(sorted(repaired)),
+            )
+        )
+
+    return db_changes, file_changes
+
+
 def as_int(value: Any) -> int:
     try:
         return int(value or 0)
@@ -3172,9 +3308,11 @@ def normalize_album_group(
         album["year"] = canonical_year
     album.store(inherit=False)
 
-    # Synchronize physical paths using the album path format. This moves old
-    # /Singles/... files to /AlbumArtist/Album/... and moves album art too.
-    album.try_sync(write=True, move=True, inherit=False)
+    # Only synchronize an album when this repair actually changed it. Running
+    # try_sync over every existing album after every upload can unnecessarily
+    # touch sidecar artwork and file mtimes.
+    if changes:
+        album.try_sync(write=True, move=True, inherit=False)
 
     # beets stores disc fields as integers in the DB. Zero is fine internally,
     # but some players render an explicit zero as "Disc 0". Therefore remove
@@ -3307,6 +3445,10 @@ def main() -> int:
     Path(MUSIC_DIR).mkdir(parents=True, exist_ok=True)
     lib = Library(DB_PATH, MUSIC_DIR)
 
+    encoding_db_changes, encoding_file_changes = (
+        repair_library_text_encoding(lib)
+    )
+
     removed = 0
     removed += deduplicate_same_paths(lib)
     removed += deduplicate_exact_files(lib)
@@ -3334,6 +3476,8 @@ def main() -> int:
         if clear_physical_disc_tags(item_path(item)):
             disc_file_changes += 1
 
+    print(f"MUSIC_CLOUD_ENCODING_DB_FIXED={encoding_db_changes}")
+    print(f"MUSIC_CLOUD_ENCODING_FILES_FIXED={encoding_file_changes}")
     print(f"MUSIC_CLOUD_REMOVED={removed}")
     print(f"MUSIC_CLOUD_ALBUM_CHANGES={album_changes}")
     print(f"MUSIC_CLOUD_DISC_DB_CLEARED={disc_db_changes}")
@@ -3414,6 +3558,119 @@ def humanize(value: str) -> str:
     value = re.sub(r"[_\s]+", " ", value)
     value = re.sub(r"\s*,\s*", ", ", value)
     return value.strip(" ._-–—")
+
+
+CORE_TEXT_TAGS = (
+    "artist",
+    "title",
+    "album",
+    "albumartist",
+    "genre",
+    "composer",
+)
+
+
+def cyrillic_letters(value: str) -> int:
+    count = 0
+    for char in value:
+        if not char.isalpha():
+            continue
+        try:
+            if "CYRILLIC" in unicodedata.name(char):
+                count += 1
+        except ValueError:
+            pass
+    return count
+
+
+def alphabetic_letters(value: str) -> int:
+    return sum(1 for char in value if char.isalpha())
+
+
+def latin1_high_chars(value: str) -> int:
+    return sum(1 for char in value if 0x00C0 <= ord(char) <= 0x00FF)
+
+
+def repair_cp1251_mojibake(value: str) -> tuple[str, bool]:
+    """Repair CP1251 bytes that were decoded as Latin-1.
+
+    Example:
+        Áåññîçíàòåëüíîå -> Бессознательное
+
+    The thresholds are intentionally strict: the decoded candidate must be
+    predominantly Cyrillic, while the source must contain several Latin-1
+    high-byte characters. This avoids damaging real Western metadata.
+    """
+    if not value:
+        return value, False
+
+    try:
+        candidate = value.encode("latin-1").decode("cp1251")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        return value, False
+
+    if candidate == value:
+        return value, False
+
+    letters = alphabetic_letters(candidate)
+    cyr = cyrillic_letters(candidate)
+    high = latin1_high_chars(value)
+
+    if letters < 2 or cyr < 2:
+        return value, False
+
+    # Short Russian titles like "Пях" still pass, while "Mötley Crüe" does not.
+    cyr_ratio = cyr / max(1, letters)
+    high_ratio = high / max(1, alphabetic_letters(value))
+
+    if cyr_ratio < 0.55 or high_ratio < 0.45:
+        return value, False
+
+    # Reject control-heavy or replacement-character results.
+    if "\ufffd" in candidate:
+        return value, False
+    if any(ord(char) < 32 and char not in "\t\r\n" for char in candidate):
+        return value, False
+
+    return candidate, True
+
+
+def repair_easy_text_tags(audio) -> list[str]:
+    """Repair only text fields; unrelated frames/artwork remain untouched."""
+    if audio is None or not getattr(audio, "tags", None):
+        return []
+
+    repaired_fields: list[str] = []
+
+    for key in CORE_TEXT_TAGS:
+        try:
+            values = audio.tags.get(key, [])
+        except Exception:
+            continue
+        if not values:
+            continue
+
+        if isinstance(values, str):
+            values = [values]
+
+        changed = False
+        fixed_values: list[str] = []
+        for raw in values:
+            text = str(raw)
+            fixed, repaired = repair_cp1251_mojibake(text)
+            fixed_values.append(fixed)
+            changed |= repaired
+
+        if not changed:
+            continue
+
+        try:
+            audio.tags[key] = fixed_values
+            repaired_fields.append(key)
+        except Exception:
+            continue
+
+    return repaired_fields
 
 
 def normalized_tokens(value: str) -> list[str]:
@@ -3527,6 +3784,7 @@ def known_artists(library_db: str) -> list[str]:
                     f"WHERE {column} IS NOT NULL AND trim({column}) <> ''"
                 ):
                     text = plain(value)
+                    text, _ = repair_cp1251_mojibake(text)
                     if text and not missing(text):
                         result.add(text)
         finally:
@@ -3737,6 +3995,8 @@ def process(path: Path, artists: list[str]) -> tuple[bool, str]:
             else "unsupported/unknown audio format"
         )
 
+    encoding_fields = repair_easy_text_tags(audio)
+
     current_artist, current_title = tag_values(audio)
     stem = path.stem
 
@@ -3756,6 +4016,10 @@ def process(path: Path, artists: list[str]) -> tuple[bool, str]:
     fallback_title = humanize(strip_track_prefix(stem)) or stem
 
     changes: list[str] = []
+    if encoding_fields:
+        changes.append(
+            "encoding_fixed=" + ",".join(sorted(encoding_fields))
+        )
     if need_artist and guessed_artist:
         changes.append(f"artist={guessed_artist!r}")
     if need_title:
@@ -3769,7 +4033,7 @@ def process(path: Path, artists: list[str]) -> tuple[bool, str]:
     if not ensure_tags(audio):
         return False, "cannot create tag container"
 
-    changed = False
+    changed = bool(encoding_fields)
     if need_artist and guessed_artist:
         changed |= set_easy_tag(audio, "artist", guessed_artist)
 
@@ -5148,6 +5412,7 @@ from __future__ import annotations
 
 import re
 import socket
+import sqlite3
 import sys
 import time
 import urllib3.util.connection as urllib3_connection
@@ -5201,7 +5466,8 @@ last_request = 0.0
 failures = 0
 search_cache: dict[tuple[str, str], list[dict[str, Any]]] = {}
 release_cache: dict[str, dict[str, Any] | None] = {}
-cover_cache: dict[tuple[str, str], bytes | None] = {}
+cover_cache: dict[tuple[str, str, str, str], tuple[bytes | None, str]] = {}
+library_cover_cache: dict[tuple[str, str], bytes | None] = {}
 
 
 def plain(value: object) -> str:
@@ -6032,36 +6298,163 @@ def itunes_cover_url(albumartist: str, album: str) -> str:
     return url.replace("100x100bb", "1200x1200bb")
 
 
+def image_from_existing_file(path: Path) -> bytes | None:
+    if not path.is_file():
+        return None
+
+    # Prefer the embedded image: Navidrome is already displaying this exact
+    # artwork, so it is the safest source for a new track added to the album.
+    try:
+        media = MediaFile(str(path))
+        images = media.images
+        if images:
+            for image in images:
+                data = getattr(image, "data", None)
+                if isinstance(data, bytes) and valid_image_bytes(data):
+                    return data
+    except Exception:
+        pass
+
+    # Older imports may have only a sidecar image.
+    for name in (
+        "cover.jpg", "cover.jpeg", "cover.png", "cover.webp",
+        "folder.jpg", "folder.jpeg", "folder.png",
+        "front.jpg", "front.jpeg", "front.png",
+    ):
+        candidate = path.parent / name
+        try:
+            data = candidate.read_bytes()
+        except OSError:
+            continue
+        if valid_image_bytes(data):
+            return data
+
+    return None
+
+
+def existing_library_cover(
+    albumartist: str,
+    album: str,
+) -> bytes | None:
+    key = (norm(albumartist), norm(album))
+    if not key[0] or not key[1]:
+        return None
+    if key in library_cover_cache:
+        return library_cover_cache[key]
+
+    db_path = Path(
+        os.environ.get(
+            "MUSIC_CLOUD_BEETS_DB",
+            "/etc/music-cloud/beets/library.db",
+        )
+    )
+    if not db_path.is_file():
+        library_cover_cache[key] = None
+        return None
+
+    matches: list[Path] = []
+    try:
+        # Read only. We intentionally do not modify the beets DB here.
+        connection = sqlite3.connect(
+            f"file:{db_path}?mode=ro",
+            uri=True,
+            timeout=3,
+        )
+        connection.row_factory = sqlite3.Row
+        columns = {
+            str(row["name"])
+            for row in connection.execute("PRAGMA table_info(items)")
+        }
+        required = {"path", "album", "albumartist", "artist"}
+        if not required.issubset(columns):
+            connection.close()
+            library_cover_cache[key] = None
+            return None
+
+        rows = connection.execute(
+            "SELECT path, album, albumartist, artist FROM items "
+            "WHERE album IS NOT NULL AND album != ''"
+        )
+        for row in rows:
+            row_album = plain(row["album"])
+            row_albumartist = plain(row["albumartist"]) or plain(row["artist"])
+            if (
+                norm(row_album) != key[1]
+                or norm(row_albumartist) != key[0]
+            ):
+                continue
+
+            raw_path = row["path"]
+            if isinstance(raw_path, bytes):
+                path = Path(os.fsdecode(raw_path))
+            else:
+                path = Path(str(raw_path))
+            matches.append(path)
+
+        connection.close()
+    except Exception as exc:
+        print(
+            f"ART-WARN: cannot inspect existing library artwork: {exc}",
+            flush=True,
+        )
+        library_cover_cache[key] = None
+        return None
+
+    for path in matches:
+        content = image_from_existing_file(path)
+        if content:
+            library_cover_cache[key] = content
+            return content
+
+    library_cover_cache[key] = None
+    return None
+
+
 def cover_bytes(
     release_id: str,
     release_group_id: str,
     albumartist: str,
     album: str,
 ) -> tuple[bytes | None, str]:
-    key = (release_id, release_group_id)
+    # Album name/artist are part of the key. Previously ("", "") MusicBrainz
+    # IDs caused unrelated albums without MBIDs to share the same cached cover.
+    key = (
+        release_id,
+        release_group_id,
+        norm(albumartist),
+        norm(album),
+    )
     if key in cover_cache:
-        cached = cover_cache[key]
-        return cached, "cache" if cached else "not-found"
+        return cover_cache[key]
 
-    # 1. Exact MusicBrainz release.
+    # WRITE-ONCE RULE:
+    # If this logical album already exists in the library and already has a
+    # cover, that exact cover wins forever during automatic imports. A newly
+    # uploaded track is made consistent with the existing album; the existing
+    # album is never refreshed from the network.
+    existing = existing_library_cover(albumartist, album)
+    if existing:
+        result = (existing, "existing-library")
+        cover_cache[key] = result
+        return result
+
+    # Only a genuinely new / coverless album may consult external sources.
     if release_id:
         url = caa_front_url("release", release_id)
         content = download_image(url)
         if content:
-            cover_cache[key] = content
-            return content, "caa-release"
+            result = (content, "caa-release")
+            cover_cache[key] = result
+            return result
 
-    # 2. Canonical front for the MusicBrainz release group.
     if release_group_id:
         url = caa_front_url("release-group", release_group_id)
         content = download_image(url)
         if content:
-            cover_cache[key] = content
-            return content, "caa-release-group"
+            result = (content, "caa-release-group")
+            cover_cache[key] = result
+            return result
 
-    # 3. Another official edition of the same album. This is important when the
-    # recording search selects an edition with no uploaded cover while another
-    # edition of the exact same release group has front art.
     if release_group_id:
         for sibling_id in sibling_release_ids(release_group_id):
             if sibling_id == release_id:
@@ -6069,19 +6462,20 @@ def cover_bytes(
             url = caa_front_url("release", sibling_id)
             content = download_image(url)
             if content:
-                cover_cache[key] = content
-                return content, "caa-sibling-release"
+                result = (content, "caa-sibling-release")
+                cover_cache[key] = result
+                return result
 
-    # 4. Restore the fallback that the original installer got from beets'
-    # fetchart plugin: iTunes album artwork by albumartist + album.
     url = itunes_cover_url(albumartist, album)
     content = download_image(url)
     if content:
-        cover_cache[key] = content
-        return content, "itunes"
+        result = (content, "itunes")
+        cover_cache[key] = result
+        return result
 
-    cover_cache[key] = None
-    return None, "not-found"
+    result = (None, "not-found")
+    cover_cache[key] = result
+    return result
 
 
 def embed_cover_if_missing(
@@ -6831,6 +7225,8 @@ TRUST_COMPLETE_ALBUM_TAGS=1
 REPAIR_SINGLETON_ALBUMS=1
 DISABLE_DISC_METADATA=1
 SAFE_ALBUM_MERGE_EVIDENCE=1
+IMMUTABLE_EXISTING_ARTWORK=1
+REPAIR_CP1251_MOJIBAKE=1
 STABLE_SECONDS=60
 SCAN_INTERVAL=10
 IDLE_EXIT_SECONDS=120
@@ -6839,6 +7235,7 @@ MAX_BATCHES_PER_RUN=100
 # Python helpers write directly into auto-import.log. Disable block buffering so
 # ONLINE-PROGRESS/ONLINE-MATCH lines are visible immediately with tail -f.
 export PYTHONUNBUFFERED=1
+export MUSIC_CLOUD_BEETS_DB="${BEETS_CONFIG_DIR}/library.db"
 
 for required_helper in     "\${METADATA_PREFLIGHT_SCRIPT}"     "\${ONLINE_ENRICH_SCRIPT}"     "\${ALBUM_ENRICH_SCRIPT}"     "\${BATCHER}"; do
     if [[ ! -x "\${required_helper}" ]]; then
@@ -7081,15 +7478,11 @@ fi
     echo "Обработано пакетов за запуск: \${batches}"
     echo "Аудиофайлов осталось в upload: \${pending}"
 
-    # beets has a long-standing edge case where automatic fetchart during a
-    # quiet+move import can miss album artwork. Run the documented post-import
-    # fetch command once after a drain cycle, then embed any associated artwork.
-    # fetchart without --force skips albums that already have artwork.
+    # Artwork is immutable once present. Never run fetchart/embedart against
+    # the whole library after an upload: that can replace or remove artwork on
+    # albums unrelated to the current batch.
     if (( batches > 0 )); then
-        echo "Проверка отсутствующих обложек альбомов..."
-        "\${BEET}" fetchart -q || echo "fetchart: часть обложек не удалось получить"
-        "\${BEET}" embedart || echo "embedart: часть обложек не удалось встроить"
-        echo "Для singleton-треков обложка встраивается напрямую до импорта."
+        echo "Обложки существующей библиотеки не изменяются (write-once artwork policy)."
     fi
 
     if (( batches >= MAX_BATCHES_PER_RUN && pending > 0 )); then
