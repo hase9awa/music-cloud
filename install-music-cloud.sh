@@ -47,7 +47,7 @@ set -Eeuo pipefail
 # ==============================================================================
 
 APP_NAME="music-cloud"
-SCRIPT_VERSION="5.6.9-universal"
+SCRIPT_VERSION="5.7.0-universal"
 DATA_DIR="/srv/${APP_NAME}"
 STACK_DIR="/opt/${APP_NAME}"
 STATE_DIR="/etc/${APP_NAME}"
@@ -242,7 +242,7 @@ load_install_state() {
     . "${INSTALL_STATE_FILE}"
 
     case "${STATE_VERSION:-}" in
-        3|3.*|4|4.*|5.0-home-cf|5.0.1-home-cf|5.0.2-home-cf|5.1.0-universal|5.1.1-universal|5.1.2-universal|5.2.0-universal|5.2.1-universal|5.2.2-universal|5.2.3-universal|5.3.0-universal|5.4.0-universal|5.5.0-universal|5.6.0-universal|5.6.1-universal|5.6.2-universal|5.6.3-universal|5.6.4-universal|5.6.5-universal|5.6.6-universal|5.6.7-universal|5.6.8-universal|5.6.9-universal)
+        3|3.*|4|4.*|5.0-home-cf|5.0.1-home-cf|5.0.2-home-cf|5.1.0-universal|5.1.1-universal|5.1.2-universal|5.2.0-universal|5.2.1-universal|5.2.2-universal|5.2.3-universal|5.3.0-universal|5.4.0-universal|5.5.0-universal|5.6.0-universal|5.6.1-universal|5.6.2-universal|5.6.3-universal|5.6.4-universal|5.6.5-universal|5.6.6-universal|5.6.7-universal|5.6.8-universal|5.6.9-universal|5.7.0-universal)
             ;;
         *)
             die "Неподдерживаемая версия файла состояния ${INSTALL_STATE_FILE}."
@@ -2920,6 +2920,107 @@ def logical_item_key(item: Any) -> tuple[Any, ...] | None:
     return ("logical_album", albumartist, album)
 
 
+def field_support(items: list[Any], key: str) -> tuple[list[str], int]:
+    """Return unique non-empty values and number of items carrying the winner."""
+    raw_values = [
+        str(value(item, key) or "").strip()
+        for item in items
+        if str(value(item, key) or "").strip()
+    ]
+    if not raw_values:
+        return [], 0
+
+    counts = Counter(norm(raw) for raw in raw_values)
+    winner_norm, support = counts.most_common(1)[0]
+
+    unique: dict[str, str] = {}
+    for raw in raw_values:
+        unique.setdefault(norm(raw), raw)
+
+    return list(unique.values()), support
+
+
+def contiguous_track_sequence(items: list[Any]) -> bool:
+    tracks = [
+        as_int(value(item, "track"))
+        for item in items
+        if as_int(value(item, "track")) > 0
+    ]
+    if len(items) < 3 or len(tracks) != len(items):
+        return False
+    if len(set(tracks)) != len(tracks):
+        return False
+
+    ordered = sorted(tracks)
+    return ordered[0] == 1 and ordered == list(range(1, ordered[-1] + 1))
+
+
+def tracktotal_evidence(items: list[Any]) -> bool:
+    totals = [
+        as_int(value(item, "tracktotal"))
+        for item in items
+        if as_int(value(item, "tracktotal")) > 1
+    ]
+    tracks = [
+        as_int(value(item, "track"))
+        for item in items
+        if as_int(value(item, "track")) > 0
+    ]
+
+    if len(items) < 3 or not totals or len(tracks) != len(items):
+        return False
+    if len(set(tracks)) != len(tracks):
+        return False
+
+    counts = Counter(totals)
+    expected_total, support = counts.most_common(1)[0]
+
+    # Require the same total on a majority of the candidate group and enough
+    # tracks to make accidental grouping unlikely.
+    if support < max(2, (len(items) + 1) // 2):
+        return False
+    if any(track > expected_total for track in tracks):
+        return False
+
+    coverage = len(set(tracks)) / expected_total
+    return coverage >= 0.60
+
+
+def album_merge_evidence(items: list[Any]) -> tuple[bool, str]:
+    """Decide whether it is safe to turn items into one beets Album."""
+    if len(items) < 2:
+        return False, "fewer than two tracks"
+
+    rgids, rg_support = field_support(items, "mb_releasegroupid")
+    release_ids, release_support = field_support(items, "mb_albumid")
+
+    # Two different MusicBrainz release groups are strong evidence that these
+    # tracks should NOT be merged, even if Album Artist + Album happen to match.
+    if len(rgids) > 1:
+        return False, "conflicting MusicBrainz release-group IDs"
+
+    # Same release-group across at least two tracks is strong evidence.
+    if len(rgids) == 1 and rg_support >= 2:
+        return True, "shared MusicBrainz release-group"
+
+    # Same exact release across at least two tracks is also strong.
+    if len(release_ids) == 1 and release_support >= 2:
+        return True, "shared MusicBrainz release"
+
+    # A complete 1..N numbering sequence is strong even when earlier enrichment
+    # accidentally selected different editions of the same album. This keeps
+    # the previous ПаТрУлИ xXx repair case working.
+    if contiguous_track_sequence(items):
+        return True, "contiguous track sequence 1..N"
+
+    # Partial albums can be recovered when tracktotal metadata is consistent and
+    # at least 60% of the expected track list is present.
+    if tracktotal_evidence(items):
+        return True, "consistent tracktotal with >=60% coverage"
+
+    return False, "Album Artist + Album only; insufficient independent evidence"
+
+
 def clear_physical_disc_tags(path: str) -> bool:
     if not path or not os.path.isfile(path):
         return False
@@ -3021,7 +3122,8 @@ def normalize_album_group(
 
     if len(album_ids) > 1:
         print(
-            "ALBUM: conflicting MusicBrainz release IDs; clearing them: "
+            "ALBUM: safe group has conflicting MusicBrainz release IDs; "
+            "clearing edition-specific IDs: "
             + ", ".join(sorted(album_ids))
         )
 
@@ -3107,6 +3209,19 @@ def consolidate_albums(lib: Library) -> int:
         if len(items) < 2:
             # One true single with an Album tag should remain a singleton.
             continue
+
+        safe_to_merge, evidence = album_merge_evidence(items)
+        if not safe_to_merge:
+            print(
+                "ALBUM-SKIP: refusing automatic merge for "
+                f"{key!r}: {evidence}; tracks={len(items)}"
+            )
+            continue
+
+        print(
+            "ALBUM-MERGE-EVIDENCE: "
+            f"{key!r}: {evidence}; tracks={len(items)}"
+        )
 
         # Avoid accidentally merging genuinely different same-name releases
         # when the items contain more than one explicit non-zero year.
@@ -6715,6 +6830,7 @@ ALBUM_FOLDER_ATOMIC=1
 TRUST_COMPLETE_ALBUM_TAGS=1
 REPAIR_SINGLETON_ALBUMS=1
 DISABLE_DISC_METADATA=1
+SAFE_ALBUM_MERGE_EVIDENCE=1
 STABLE_SECONDS=60
 SCAN_INTERVAL=10
 IDLE_EXIT_SECONDS=120
