@@ -47,7 +47,7 @@ set -Eeuo pipefail
 # ==============================================================================
 
 APP_NAME="music-cloud"
-SCRIPT_VERSION="5.6.6-universal"
+SCRIPT_VERSION="5.6.7-universal"
 DATA_DIR="/srv/${APP_NAME}"
 STACK_DIR="/opt/${APP_NAME}"
 STATE_DIR="/etc/${APP_NAME}"
@@ -242,7 +242,7 @@ load_install_state() {
     . "${INSTALL_STATE_FILE}"
 
     case "${STATE_VERSION:-}" in
-        3|3.*|4|4.*|5.0-home-cf|5.0.1-home-cf|5.0.2-home-cf|5.1.0-universal|5.1.1-universal|5.1.2-universal|5.2.0-universal|5.2.1-universal|5.2.2-universal|5.2.3-universal|5.3.0-universal|5.4.0-universal|5.5.0-universal|5.6.0-universal|5.6.1-universal|5.6.2-universal|5.6.3-universal|5.6.4-universal|5.6.5-universal|5.6.6-universal)
+        3|3.*|4|4.*|5.0-home-cf|5.0.1-home-cf|5.0.2-home-cf|5.1.0-universal|5.1.1-universal|5.1.2-universal|5.2.0-universal|5.2.1-universal|5.2.2-universal|5.2.3-universal|5.3.0-universal|5.4.0-universal|5.5.0-universal|5.6.0-universal|5.6.1-universal|5.6.2-universal|5.6.3-universal|5.6.4-universal|5.6.5-universal|5.6.6-universal|5.6.7-universal)
             ;;
         *)
             die "Неподдерживаемая версия файла состояния ${INSTALL_STATE_FILE}."
@@ -2545,43 +2545,32 @@ def inside_music_dir(path: str) -> bool:
 
 
 def album_key_from_item(item: Any, *, strict: bool) -> tuple[Any, ...] | None:
+    # A personal library should not split the same album merely because
+    # different tracks were enriched against different MusicBrainz editions.
+    # Album Artist + Album is the stable logical identity for consolidation.
+    albumartist = norm(value(item, "albumartist")) or norm(value(item, "artist"))
+    album = norm(value(item, "album"))
+    if albumartist and album:
+        return ("logical_album", albumartist, album)
+
     mb_albumid = norm(value(item, "mb_albumid"))
     if mb_albumid:
         return ("mb_album", mb_albumid)
 
-    albumartist = norm(value(item, "albumartist")) or norm(value(item, "artist"))
-    album = norm(value(item, "album"))
-    if not albumartist or not album:
-        return None
-
-    if strict:
-        return (
-            "album",
-            albumartist,
-            album,
-            as_int(value(item, "year")),
-            norm(value(item, "albumdisambig")),
-        )
-    return ("album", albumartist, album)
+    return None
 
 
 def album_key(album: Any) -> tuple[Any, ...] | None:
+    albumartist = norm(value(album, "albumartist"))
+    title = norm(value(album, "album"))
+    if albumartist and title:
+        return ("logical_album", albumartist, title)
+
     mb_albumid = norm(value(album, "mb_albumid"))
     if mb_albumid:
         return ("mb_album", mb_albumid)
 
-    albumartist = norm(value(album, "albumartist"))
-    title = norm(value(album, "album"))
-    if not albumartist or not title:
-        return None
-
-    return (
-        "album",
-        albumartist,
-        title,
-        as_int(value(album, "year")),
-        norm(value(album, "albumdisambig")),
-    )
+    return None
 
 
 def track_key(item: Any) -> tuple[Any, ...] | None:
@@ -2926,7 +2915,8 @@ def consolidate_albums(lib: Library) -> int:
         item.store()
         changes += 1
         print(
-            "ALBUM: attached singleton id={} to album id={}".format(
+            "ALBUM: attached singleton id={} to album id={} "
+            "(will be moved to album path)".format(
                 value(item, "id"), value(target, "id")
             )
         )
@@ -5744,6 +5734,45 @@ def process(path: Path) -> tuple[bool, str]:
         audio, "musicbrainz_releasegroupid"
     )
 
+    # Album folders with complete embedded core metadata are authoritative.
+    # Do not independently assign a MusicBrainz release ID to every track:
+    # different tracks can otherwise select different editions of the same
+    # release and split one physical album into multiple logical albums.
+    staged_as_album = "albums" in path.parts
+    trusted_album_tags = (
+        staged_as_album
+        and not missing(current_artist)
+        and not missing(current_title)
+        and not missing(current_album)
+        and bool(current_track)
+        and not missing(current_albumartist or current_artist)
+    )
+    if trusted_album_tags:
+        release_group_id = current_release_group_mbid
+        if current_release_mbid and not release_group_id:
+            existing_detail = release_detail(current_release_mbid)
+            if (
+                existing_detail
+                and isinstance(existing_detail.get("release-group"), dict)
+            ):
+                release_group_id = plain(
+                    existing_detail["release-group"].get("id")
+                )
+
+        art_status = embed_cover_if_missing(
+            path,
+            current_release_mbid,
+            release_group_id,
+            current_albumartist or current_artist,
+            current_album,
+        )
+        changed = art_status.startswith("embedded:")
+        return changed, (
+            "trusted embedded album metadata; "
+            f"artist={current_artist!r}; album={current_album!r}; "
+            f"track={current_track!r}; art={art_status}"
+        )
+
     # Textual metadata can already be complete while artwork is still missing.
     # Artwork is therefore repaired independently from the metadata gap-filler.
     if (
@@ -6187,8 +6216,28 @@ def choose_files(
     selected_albums: list[Path] = []
     selected_singles: list[Path] = []
     selected_album_dirs: set[Path] = set()
+    deferred_album_files: set[Path] = set()
     remaining = limit
     cutoff = time.time() - stable_seconds
+
+    # Critical album-upload rule:
+    # if a directory already has strong album evidence, never import the first
+    # stable tracks from it as singletons while the rest of the directory is
+    # still being copied. Wait for the whole album directory to become stable.
+    #
+    # Without this guard, a 15-track upload could become:
+    #   first 7 tracks -> singleton import
+    #   remaining 8    -> album import
+    # which later produces duplicate album objects and Singles/... paths.
+    for parent, files in groups.items():
+        if parent == upload or len(files) > MAX_ALBUM_GROUP:
+            continue
+        if not _confident_album_directory(upload, parent, files):
+            continue
+        if not all(path in stable_set for path in files):
+            deferred_album_files.update(
+                path for path in files if path in stable_set
+            )
 
     album_candidates: list[tuple[float, Path, list[Path]]] = []
     for parent, files in groups.items():
@@ -6221,9 +6270,19 @@ def choose_files(
         # Everything not proven to be an album is imported as singletons. This
         # is deliberately conservative: preserving a filename is better than
         # manufacturing an Unknown Album with track numbers 0/0.
-        singles = [path for path in stable if path not in selected_albums]
+        singles = [
+            path for path in stable
+            if path not in selected_albums
+            and path not in deferred_album_files
+        ]
         singles.sort(key=lambda p: p.stat().st_mtime if p.exists() else 0)
         selected_singles.extend(singles[:remaining])
+
+    if deferred_album_files:
+        print(
+            f"BATCH_DEFERRED_ALBUM_AUDIO={len(deferred_album_files)}",
+            file=sys.stderr,
+        )
 
     return selected_albums, selected_singles, selected_album_dirs
 
@@ -6348,6 +6407,8 @@ LOCK="/run/lock/${APP_NAME}-beets.lock"
 BATCH_SIZE=25
 NETWORK_ALBUM_DISCOVERY=0
 FILENAME_DASH_ORIENTATION=compare-both
+ALBUM_FOLDER_ATOMIC=1
+TRUST_COMPLETE_ALBUM_TAGS=1
 STABLE_SECONDS=60
 SCAN_INTERVAL=10
 IDLE_EXIT_SECONDS=120
@@ -8040,6 +8101,12 @@ PYREQUEUE
 
     # Clean duplicate database/file entries created by earlier importer versions.
     run_as_owner "${DEDUPE_SCRIPT}" || warn "Не удалось полностью очистить старые дубли; импорт продолжится."
+
+    # Recalculate physical paths after album consolidation. beets' move command
+    # moves each item to the path selected by the current path format.
+    run_as_owner "${BEETS_WRAPPER}" move ||
+        warn "Не удалось полностью нормализовать пути библиотеки."
+
     systemctl start --no-block "${AUTO_IMPORT_SERVICE}" || true
 
     ok "Механизм импорта восстановлен."
