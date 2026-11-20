@@ -47,7 +47,7 @@ set -Eeuo pipefail
 # ==============================================================================
 
 APP_NAME="music-cloud"
-SCRIPT_VERSION="5.7.2-universal"
+SCRIPT_VERSION="5.8.0-universal"
 DATA_DIR="/srv/${APP_NAME}"
 STACK_DIR="/opt/${APP_NAME}"
 STATE_DIR="/etc/${APP_NAME}"
@@ -107,10 +107,10 @@ CLOUDFLARED_SERVICE="${APP_NAME}-cloudflared.service"
 DOCKER_STORAGE_DROPIN="/etc/systemd/system/docker.service.d/${APP_NAME}-storage.conf"
 
 # Pinned application versions. Update these constants deliberately after testing.
-NAVIDROME_IMAGE="deluan/navidrome:0.63.0"
-COPYPARTY_IMAGE="copyparty/ac:1.20.19"
-TAGR_GIT_REF="v1.8.6"
-BEETS_VERSION="2.4.0"
+NAVIDROME_IMAGE="deluan/navidrome:0.64.2"
+COPYPARTY_IMAGE="copyparty/ac:1.20.26"
+TAGR_GIT_REF="v1.16.2"
+BEETS_VERSION="2.14.1"
 
 # Local Tagr build safeguards for small ARM boards and mini PCs.
 TAGR_BUILD_TIMEOUT="180m"
@@ -128,6 +128,7 @@ DNS_MATCH=0
 TUNNEL_TOKEN=""
 DOCKER_REPO_OS=""
 OS_CODENAME=""
+USING_EXISTING_DOCKER=0
 
 parse_arguments() {
     while (( $# > 0 )); do
@@ -143,6 +144,9 @@ parse_arguments() {
                 ;;
             --repair-import|repair-import)
                 ACTION="repair-import"
+                ;;
+            --repair-tunnel|repair-tunnel)
+                ACTION="repair-tunnel"
                 ;;
             --mode)
                 shift
@@ -242,7 +246,7 @@ load_install_state() {
     . "${INSTALL_STATE_FILE}"
 
     case "${STATE_VERSION:-}" in
-        3|3.*|4|4.*|5.0-home-cf|5.0.1-home-cf|5.0.2-home-cf|5.1.0-universal|5.1.1-universal|5.1.2-universal|5.2.0-universal|5.2.1-universal|5.2.2-universal|5.2.3-universal|5.3.0-universal|5.4.0-universal|5.5.0-universal|5.6.0-universal|5.6.1-universal|5.6.2-universal|5.6.3-universal|5.6.4-universal|5.6.5-universal|5.6.6-universal|5.6.7-universal|5.6.8-universal|5.6.9-universal|5.7.0-universal|5.7.1-universal|5.7.2-universal)
+        3|3.*|4|4.*|5.0-home-cf|5.0.1-home-cf|5.0.2-home-cf|5.1.0-universal|5.1.1-universal|5.1.2-universal|5.2.0-universal|5.2.1-universal|5.2.2-universal|5.2.3-universal|5.3.0-universal|5.4.0-universal|5.5.0-universal|5.6.0-universal|5.6.1-universal|5.6.2-universal|5.6.3-universal|5.6.4-universal|5.6.5-universal|5.6.6-universal|5.6.7-universal|5.6.8-universal|5.6.9-universal|5.7.0-universal|5.7.1-universal|5.7.2-universal|5.8.0-universal)
             ;;
         *)
             die "Неподдерживаемая версия файла состояния ${INSTALL_STATE_FILE}."
@@ -649,7 +653,9 @@ check_command_port() {
     local port="$1"
     local label="$2"
 
-    if ! ss -ltnH 2>/dev/null | awk '{print $4}' | grep -Eq "[:.]${port}$"; then
+    # Read all socket rows instead of grep -q: early SIGPIPE is an error with pipefail.
+    if ! ss -ltnH 2>/dev/null |
+        awk -v port="${port}" '{ if ($4 ~ (":" port "$") ) found=1 } END {exit !found}'; then
         return
     fi
 
@@ -708,7 +714,10 @@ check_os() {
     [[ -n "${OS_CODENAME}" ]] || die "Не удалось определить VERSION_CODENAME для репозитория Docker."
 
     case "${DOCKER_REPO_OS}:${VERSION_ID:-}" in
-        ubuntu:22.04|ubuntu:24.04|ubuntu:26.04|debian:11|debian:12|debian:13)
+        ubuntu:22.04|ubuntu:24.04|ubuntu:26.04|debian:12|debian:13)
+            ;;
+        debian:11)
+            die "Debian 11 использует Python 3.9, а beets ${BEETS_VERSION} требует Python 3.10+. Используйте Debian 12/13 либо Ubuntu 22.04+."
             ;;
         *)
             warn "Версия ${PRETTY_NAME:-неизвестно} не входит в проверенный список установщика."
@@ -769,7 +778,8 @@ remove_conflicting_docker_packages() {
     fi
 
     warn "Обнаружены пакеты, конфликтующие с официальным Docker Engine: ${conflicts[*]}"
-    ask_yes_no "Удалить конфликтующие пакеты и продолжить?" "y" ||
+    # Never remove a system's container runtime just because Enter was pressed.
+    ask_yes_no "Удалить конфликтующие пакеты и продолжить?" "n" ||
         die "Установка Docker отменена."
 
     apt-get remove -y "${conflicts[@]}"
@@ -908,6 +918,23 @@ EOF
 }
 
 install_docker() {
+    # Do not overwrite daemon.json, containerd config or Docker data-root on
+    # hosts where the user already operates a working Docker installation.
+    if command -v docker >/dev/null 2>&1; then
+        if ! docker info >/dev/null 2>&1; then
+            systemctl start docker.service 2>/dev/null || true
+        fi
+        if ! docker info >/dev/null 2>&1; then
+            die "Docker уже установлен, но daemon недоступен. Исправьте Docker вручную; установщик не будет перезаписывать его конфигурацию."
+        fi
+        docker compose version >/dev/null 2>&1 ||
+            die "Docker работает, но отсутствует Compose V2: установите docker-compose-plugin (или docker-compose-v2) и повторите запуск."
+        USING_EXISTING_DOCKER=1
+        ok "Используется работающий Docker; daemon.json, containerd и data-root не изменяются."
+        return
+    fi
+
+    USING_EXISTING_DOCKER=0
     if [[ "${DEPLOY_MODE}" == "home" ]]; then
         install_docker_home
     else
@@ -947,9 +974,19 @@ EOF
     apt-get update
     apt-get install -y cloudflared
 
-    cloudflared --version
-    cloudflared tunnel run --help 2>&1 | grep -q -- '--token-file' ||
-        die "Установленная версия cloudflared не поддерживает --token-file (требуется 2025.4.0 или новее)."
+    # Cloudflare documents token-file support from 2025.4.0 onward.
+    # Do not grep the help output: in pipefail mode grep -q can close the
+    # pipeline early (SIGPIPE), falsely treating supported builds as old.
+    local installed_version version_output
+    [[ -x /usr/bin/cloudflared ]] || die "Пакет cloudflared не установил /usr/bin/cloudflared."
+    version_output="$(/usr/bin/cloudflared --version)"
+    printf '%s\n' "${version_output}"
+    installed_version="$(sed -nE 's/^cloudflared version ([0-9]{4}\.[0-9]+\.[0-9]+).*$/\1/p' <<<"${version_output}")"
+    [[ -n "${installed_version}" ]] || die "Не удалось определить версию cloudflared: ${version_output}"
+    if dpkg --compare-versions "${installed_version}" lt "2025.4.0"; then
+        die "cloudflared ${installed_version} слишком старый: для --token-file нужна версия 2025.4.0+."
+    fi
+    ok "cloudflared ${installed_version}: --token-file поддерживается (Cloudflare 2025.4.0+)."
 }
 
 # ------------------------------------------------------------------------------
@@ -1159,6 +1196,18 @@ prepare_library_directory() {
 configure_storage_boot_dependency() {
     local mount_target
 
+    if (( USING_EXISTING_DOCKER == 1 )); then
+        # A previous Music Cloud installer may have installed a drop-in that
+        # blocks ALL Docker workloads when the music drive is disconnected.
+        # Remove only our own drop-in; leave all other Docker settings intact.
+        if [[ -f "${DOCKER_STORAGE_DROPIN}" ]]; then
+            rm -f "${DOCKER_STORAGE_DROPIN}"
+            systemctl daemon-reload
+            warn "Удалена глобальная зависимость Docker от музыкального диска: остальные контейнеры больше не зависят от него."
+        fi
+        return
+    fi
+
     mount_target="$(findmnt -no TARGET --target "${LIBRARY_DIR}" 2>/dev/null || true)"
     if [[ -z "${mount_target}" || "${mount_target}" == "/" ]]; then
         rm -f "${DOCKER_STORAGE_DROPIN}"
@@ -1211,6 +1260,9 @@ create_directories() {
 install_beets() {
     log "Установка beets, MusicBrainz и Chroma/AcoustID"
 
+    python3 -c 'import sys; raise SystemExit(not ((3, 10) <= sys.version_info[:2] < (3, 15)))' ||
+        die "beets ${BEETS_VERSION} требует Python от 3.10 до 3.14 включительно. Обнаружен $(python3 --version 2>&1)."
+
     install -d -m 0700 -o "${RUN_USER}" -g "${RUN_GROUP}" \
         "${BEETS_VENV}" \
         "${BEETS_CONFIG_DIR}"
@@ -1222,109 +1274,16 @@ install_beets() {
     run_as_owner "${BEETS_VENV}/bin/pip" install --upgrade pip wheel
     # lastgenre входит в beets, но его зависимость pylast является optional.
     # Устанавливаем официальный extra, чтобы плагин был действительно работоспособен.
+    # Install declared optional dependencies for all enabled beets plugins.
     run_as_owner "${BEETS_VENV}/bin/pip" install --upgrade \
-        "beets[lastgenre]==${BEETS_VERSION}" \
+        "beets[chroma,fetchart,embedart,lastgenre]==${BEETS_VERSION}" \
         requests \
         pyacoustid \
         Pillow
 
-    # beets 2.4.0 несовместим с Python 3.14 в term_width(): старый код
-    # использует fcntl.ioctl() с 4-байтным строковым буфером и падает с
-    # SystemError: buffer overflow ещё при импорте beets.ui. Бэкпортируем
-    # upstream-исправление на shutil.get_terminal_size(). Патч намеренно ищет
-    # границы самой функции, а не точное форматирование исходника, поэтому
-    # работает и с PyPI-сборкой, и с дистрибутивными вариантами beets 2.4.0.
-    run_as_owner "${BEETS_VENV}/bin/python" - <<'PYBEETSTERM'
-from pathlib import Path
-import importlib.util
-import sys
+    # beets >= 2.9 официально поддерживает Python 3.14. Не изменяем
+    # установленные файлы site-packages: старый monkeypatch больше не нужен.
 
-# На Python < 3.14 этот патч не требуется, но он совместим и с более старыми
-# версиями. Пропускаем его там, чтобы минимально изменять установленный пакет.
-if sys.version_info < (3, 14):
-    print("beets Python 3.14 patch not needed")
-    raise SystemExit(0)
-
-spec = importlib.util.find_spec("beets")
-if spec is None or not spec.submodule_search_locations:
-    raise SystemExit("Не удалось найти установленный пакет beets")
-
-ui_path = Path(next(iter(spec.submodule_search_locations))) / "ui" / "__init__.py"
-text = ui_path.read_text(encoding="utf-8")
-
-# Уже исправленная версия (повторный запуск установщика).
-if "shutil.get_terminal_size(fallback=(0, 0))" in text:
-    print(f"beets Python 3.14 terminal-width patch already applied: {ui_path}")
-    raise SystemExit(0)
-
-start_marker = "def term_width():"
-start = text.find(start_marker)
-if start < 0:
-    start_marker = "def term_width() -> int:"
-    start = text.find(start_marker)
-
-if start < 0:
-    raise SystemExit(f"Не найдена функция term_width() в {ui_path}")
-
-# Функция term_width в beets 2.4.0 непосредственно предшествует
-# split_into_lines(). Ищем следующий def, не полагаясь на число пустых строк.
-next_func = text.find("\ndef split_into_lines(", start)
-if next_func < 0:
-    raise SystemExit(
-        f"Не удалось определить конец term_width() в {ui_path}: "
-        "не найдена split_into_lines()"
-    )
-
-old_block = text[start:next_func + 1]
-if "fcntl.ioctl" not in old_block or "TIOCGWINSZ" not in old_block:
-    raise SystemExit(
-        f"term_width() в {ui_path} имеет неожиданную структуру; "
-        "патч не применён, чтобы не повредить пакет"
-    )
-
-# functools.cache уже импортирован в beets 2.4.0.
-if "from functools import cache\n" not in text:
-    anchor = "from functools import "
-    pos = text.find(anchor)
-    if pos >= 0:
-        line_end = text.find("\n", pos)
-        line = text[pos:line_end]
-        if "cache" not in line:
-            text = text[:line_end] + ", cache" + text[line_end:]
-    else:
-        future = "from __future__ import annotations\n"
-        if future not in text:
-            raise SystemExit(f"Не удалось безопасно добавить functools.cache в {ui_path}")
-        text = text.replace(future, future + "from functools import cache\n", 1)
-
-if "import shutil\n" not in text:
-    marker = "import re\n"
-    if marker in text:
-        text = text.replace(marker, marker + "import shutil\n", 1)
-    else:
-        marker = "import sqlite3\n"
-        if marker not in text:
-            raise SystemExit(f"Не удалось безопасно добавить import shutil в {ui_path}")
-        text = text.replace(marker, "import shutil\n" + marker, 1)
-
-# После возможного добавления импортов пересчитываем границы функции.
-start = text.find(start_marker)
-next_func = text.find("\ndef split_into_lines(", start)
-
-new_block = (
-    "@cache\n"
-    "def term_width() -> int:\n"
-    "    \"\"\"Get the width (columns) of the terminal.\"\"\"\n"
-    "    columns, _ = shutil.get_terminal_size(fallback=(0, 0))\n"
-    "    return columns if columns else config[\"ui\"][\"terminal_width\"].get(int)\n"
-    "\n"
-)
-
-text = text[:start] + new_block + text[next_func + 1:]
-compile(text, str(ui_path), "exec")
-ui_path.write_text(text, encoding="utf-8")
-print(f"beets Python 3.14 terminal-width patch applied: {ui_path}")
-PYBEETSTERM
 
 
     install -d -m 0700 -o "${RUN_USER}" -g "${RUN_GROUP}" "${BEETS_PLUGIN_DIR}"
@@ -1893,6 +1852,8 @@ import tempfile
 
 import acoustid
 import pylast
+import bs4
+import langdetect
 from PIL import Image
 from beets.util.artresizer import ArtResizer
 
@@ -1942,7 +1903,7 @@ prepare_tagr_source() {
     [[ "$(git -C "${TAGR_SOURCE_DIR}" describe --tags --exact-match 2>/dev/null || true)" == "${TAGR_GIT_REF}" ]] ||
         die "Не удалось получить закреплённую версию Tagr ${TAGR_GIT_REF}."
 
-    # Одного next.config basePath недостаточно: Tagr v1.8.6 содержит абсолютные
+    # Одного next.config basePath недостаточно: Tagr содержит абсолютные
     # пути в Auth.js, proxy, SessionProvider, PWA и изображениях. Патчим весь
     # связанный набор атомарно и завершаем установку, если структура исходников
     # неожиданно изменилась.
@@ -2010,6 +1971,20 @@ RUN --mount=type=bind,from=builder,source=/app/node_modules,target=/mnt/builder-
 # Prisma: copy schema + config, install CLI for db push & studio at runtime""",
 )
 
+# Tagr 1.16+ перенёс домашнюю страницу в /library. Server Component
+# выполняет абсолютный redirect(), поэтому снаружи нужен явный /tags.
+# Не редиректим на /library корня домена, где работает Navidrome.
+page_path, page_text = read("src/app/page.tsx")
+new_page_redirect = "redirect(song ? `${target}?song=${encodeURIComponent(song)}` : target)"
+if new_page_redirect in page_text:
+    replace_once(
+        "src/app/page.tsx",
+        new_page_redirect,
+        "redirect(song ? `/tags${target}?song=${encodeURIComponent(song)}` : `/tags${target}`)",
+    )
+elif "const songCount = await countSongs()" not in page_text:
+    raise SystemExit("Неизвестная структура src/app/page.tsx: проверьте root redirect Tagr")
+
 # Next.js: маршруты и клиентские чанки публикуются под /tags.
 # Caddy уже канонизирует /tags -> /tags/. Запрещаем Next.js выполнять обратную
 # нормализацию /tags/ -> /tags до запуска proxy, иначе возникает конфликт
@@ -2074,8 +2049,13 @@ replace_once(
 )
 replace_once(
     "src/features/musicbrainz/hooks/use-fetch-musicbrainz-cover.ts",
-    "axios.post<FetchCoverResult>(`/api/songs/${songId}/musicbrainz/fetch-cover`,",
-    "api.post<FetchCoverResult>(`/songs/${songId}/musicbrainz/fetch-cover`,",
+    "axios.post<FetchCoverResult>(",
+    "api.post<FetchCoverResult>(",
+)
+replace_once(
+    "src/features/musicbrainz/hooks/use-fetch-musicbrainz-cover.ts",
+    "`/api/songs/${songId}/musicbrainz/fetch-cover`",
+    "`/songs/${songId}/musicbrainz/fetch-cover`",
 )
 replace_once(
     "src/features/musicbrainz/hooks/use-bulk-fetch-musicbrainz-cover.ts",
@@ -2167,6 +2147,7 @@ replace_once(
 )
 
 sw_path, sw_text = read("public/sw.js")
+sw_text = sw_text.replace("tagr-static-v1", "music-cloud-tagr-v1.16.2")
 sw_text = sw_text.replace("'/icons/icon-192x192.png'", "'/tags/icons/icon-192x192.png'")
 sw_text = sw_text.replace("'/icons/icon-512x512.png'", "'/tags/icons/icon-512x512.png'")
 sw_text = sw_text.replace("event.request.url.includes('/_next/static/')", "event.request.url.includes('/tags/_next/static/')")
@@ -2200,12 +2181,13 @@ checks = {
     "src/lib/axios.ts": ["baseURL: '/tags/api'"],
     "src/features/musicbrainz/hooks/use-fetch-musicbrainz-cover.ts": [
         "import { api } from '@/lib/axios'",
-        "api.post<FetchCoverResult>(`/songs/${songId}/musicbrainz/fetch-cover`,",
+        "api.post<FetchCoverResult>(",
+        "`/songs/${songId}/musicbrainz/fetch-cover`",
     ],
     "src/features/musicbrainz/hooks/use-bulk-fetch-musicbrainz-cover.ts": [
         "fetch('/tags/api/songs/bulk/musicbrainz/fetch-cover',",
     ],
-    "src/app/page.tsx": ["const songCount = await countSongs()", "const session = await auth()"],
+    "src/app/page.tsx": [],
     "src/proxy.ts": [
         "const BASE_PATH = '/tags'",
         "const url = new URL(request.url)",
@@ -2219,11 +2201,11 @@ for rel, needles in checks.items():
             raise SystemExit(f"Патч Tagr не применён: {rel}: {needle}")
 
 page_data = (root / "src/app/page.tsx").read_text(encoding="utf-8")
-if "redirect(" in page_data or "next/navigation" in page_data:
-    raise SystemExit(
-        "Корневая server component не должна выполнять редирект: "
-        "авторизация маршрута централизована в proxy.ts."
-    )
+if "buildFolderHref" in page_data:
+    if "redirect(song ? `/tags${target}?song=${encodeURIComponent(song)}` : `/tags${target}`)" not in page_data:
+        raise SystemExit("Новый Tagr редиректит из /tags на корень домена")
+elif "redirect(" in page_data or "next/navigation" in page_data:
+    raise SystemExit("Старая корневая страница Tagr неожиданно выполняет редирект")
 
 proxy_data = (root / "src/proxy.ts").read_text(encoding="utf-8")
 # Проверяем только исполняемые строки. Комментарий выше намеренно объясняет,
@@ -2434,6 +2416,8 @@ services:
     environment:
       PUID: "${RUN_UID}"
       PGID: "${RUN_GID}"
+      # Privacy: disable Tagr optional anonymous usage insights.
+      TAGR_INSIGHTS: "false"
       NODE_ENV: production
       DATABASE_URL: "file:/data/tagr.db"
       # AUTH_URL содержит только origin. Серверный Auth.js использует
@@ -7936,7 +7920,11 @@ EOF
 
     systemd-analyze verify "/etc/systemd/system/${CLOUDFLARED_SERVICE}" >/dev/null
     systemctl daemon-reload
-    systemctl enable --now "${CLOUDFLARED_SERVICE}"
+    systemctl enable "${CLOUDFLARED_SERVICE}"
+    systemctl restart "${CLOUDFLARED_SERVICE}" || {
+        show_cloudflared_diagnostics
+        die "Не удалось запустить cloudflared после обновления unit-файла."
+    }
 
     local attempt
     for attempt in {1..45}; do
@@ -8437,7 +8425,8 @@ verify_tagr_client_api_prefix() {
        ! grep -Fq "baseURL: '/tags/api'" "${axios_file}" ||
        grep -Fq "baseURL: '/api'" "${axios_file}" ||
        [[ ! -r "${cover_file}" ]] ||
-       ! grep -Fq "api.post<FetchCoverResult>(\`/songs/\${songId}/musicbrainz/fetch-cover\`," "${cover_file}" ||
+       ! grep -Fq "api.post<FetchCoverResult>(" "${cover_file}" ||
+       ! grep -Fq '`/songs/${songId}/musicbrainz/fetch-cover`' "${cover_file}" ||
        grep -Fq "axios.post<FetchCoverResult>(\`/api/" "${cover_file}" ||
        [[ ! -r "${bulk_cover_file}" ]] ||
        ! grep -Fq "fetch('/tags/api/songs/bulk/musicbrainz/fetch-cover'" "${bulk_cover_file}" ||
@@ -8718,6 +8707,9 @@ EOF
 Ремонт импорта без переустановки:
   sudo bash $0 --repair-import
 
+Ремонт Cloudflare Tunnel без переустановки:
+  sudo bash $0 --repair-tunnel
+
 Удаление с сохранением библиотеки:
   sudo bash $0 --uninstall
 EOF
@@ -8932,6 +8924,66 @@ PYREQUEUE
     printf '\nЕсли файлы остались, выполните: sudo bash %s --diagnose\n' "$0"
 }
 
+backup_existing_installation() {
+    # Backup metadata/configuration, not the (potentially multi-terabyte) music.
+    [[ -f "${INSTALL_STATE_FILE}" || -f "${COMPOSE_FILE}" ]] || return 0
+
+    local backup_dir="/var/backups/${APP_NAME}/$(date -u +%Y%m%dT%H%M%SZ)-$$"
+    log "Резервная копия конфигураций и баз данных перед обновлением"
+    install -d -m 0700 "${backup_dir}"
+
+    python3 - "${backup_dir}" "${STACK_DIR}" "${STATE_DIR}" "${COMPOSE_FILE}" "${CREDENTIALS_FILE}" <<'PYBACKUP'
+from pathlib import Path
+import shutil
+import sqlite3
+import sys
+
+backup = Path(sys.argv[1])
+stack = Path(sys.argv[2])
+state = Path(sys.argv[3])
+compose = Path(sys.argv[4])
+credentials = Path(sys.argv[5])
+
+for source, name in (
+    (state / "install-state.env", "install-state.env"),
+    (state / "secrets" / "cloudflare-tunnel-token", "cloudflare-tunnel-token"),
+    (state / "secrets" / "tagr-login", "tagr-login"),
+    (state / "secrets" / "tagr-password", "tagr-password"),
+    (state / "secrets" / "tagr-secret", "tagr-secret"),
+    (stack / "copyparty-data" / "music-cloud.conf", "copyparty.conf"),
+    (compose, "compose.yaml"),
+    (credentials, "credentials.txt"),
+):
+    if source.is_file():
+        destination = backup / name
+        shutil.copyfile(source, destination)
+        destination.chmod(0o600)
+
+for source, name in (
+    (stack / "navidrome-data" / "navidrome.db", "navidrome.db"),
+    (stack / "tagr-data" / "tagr.db", "tagr.db"),
+    (state / "beets" / "library.db", "beets-library.db"),
+):
+    if not source.is_file():
+        continue
+    # sqlite3.backup() obtains a consistent snapshot even when the container
+    # continues writing to a WAL-enabled database during installation.
+    destination = backup / name
+    try:
+        with sqlite3.connect(f"file:{source}?mode=ro", uri=True, timeout=30) as src:
+            with sqlite3.connect(destination, timeout=30) as dst:
+                src.backup(dst)
+    except sqlite3.Error as error:
+        raise SystemExit(f"Не удалось сохранить базу {source}: {error}")
+    destination.chmod(0o600)
+
+print(f"Backup OK: {backup}")
+PYBACKUP
+
+    chmod 0700 "${backup_dir}"
+    ok "Сохранены настройки и базы данных: ${backup_dir}"
+}
+
 main_install() {
     require_root
     detect_run_user
@@ -8939,6 +8991,7 @@ main_install() {
     resolve_deployment_mode
     show_intro
     collect_settings
+    backup_existing_installation
 
     install_base_packages
     check_network_preflight
@@ -8982,6 +9035,18 @@ main_install() {
     print_result
 }
 
+repair_cloudflare_tunnel() {
+    require_root
+    [[ -r "${INSTALL_STATE_FILE}" ]] ||
+        die "Нет сохранённой установки Music Cloud. Для новой установки запустите скрипт без аргументов."
+    load_install_state
+    [[ "${DEPLOY_MODE}" == "home" ]] ||
+        die "Команда --repair-tunnel нужна только в режиме home."
+    install_cloudflared
+    write_cloudflared_service
+    ok "Cloudflare Tunnel восстановлен без пересборки контейнеров."
+}
+
 parse_arguments "$@"
 
 case "${ACTION}" in
@@ -8997,11 +9062,15 @@ case "${ACTION}" in
     repair-import)
         repair_import_automation
         ;;
+    repair-tunnel)
+        repair_cloudflare_tunnel
+        ;;
     help)
         cat <<EOF
 Usage:
   sudo bash $0 [--mode auto|vps|home]
   sudo bash $0 --repair-import
+  sudo bash $0 --repair-tunnel
   sudo bash $0 --diagnose
   sudo bash $0 --uninstall
 
